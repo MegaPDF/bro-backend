@@ -1,86 +1,65 @@
+// ==============================================
+// COMPLETE OTP STORE IMPLEMENTATION
+// Supports both Phone & Email Methods
+// ==============================================
+
+// File: src/lib/services/otp/otp-store.ts
+
 import { connectDB } from '@/lib/db/connection';
 import Settings from '@/lib/db/models/Settings';
 import { analyticsTracker } from '../analytics/tracker';
-import { OTP_CONFIG, TIME_CONSTANTS } from '@/lib/utils/constants';
 import { EncryptionService } from '@/lib/utils/encryption';
+import { TIME_CONSTANTS, OTP_CONFIG } from '@/lib/utils/constants';
+import type { OTPDeliveryInfo } from './otp-service';
+
+// ==============================================
+// INTERFACES
+// ==============================================
 
 export interface StoredOTP {
   id: string;
-  phoneNumber: string;
-  countryCode: string;
   code: string;
-  hashedCode: string;
-  createdAt: Date;
+  identifier: string; // phone number or email
+  method: 'phone' | 'email';
   expiresAt: Date;
-  isUsed: boolean;
-  isExpired: boolean;
   attempts: number;
   maxAttempts: number;
-  deliveryMethod: 'sms' | 'email' | 'both';
-  deliveryInfo: {
-    phoneNumber: string;
-    countryCode: string;
-    email?: string;
-    userName?: string;
-  };
+  isUsed: boolean;
+  isExpired: boolean;
+  createdAt: Date;
+  usedAt?: Date;
+  deliveryInfo: OTPDeliveryInfo;
+  deliveryMethod: 'phone' | 'email';
   deliveryStatus: {
-    sms?: {
-      sent: boolean;
-      sentAt?: Date;
-      error?: string;
-    };
-    email?: {
-      sent: boolean;
-      sentAt?: Date;
-      messageId?: string;
-      error?: string;
-    };
+    sent: boolean;
+    sentAt?: Date;
+    error?: string;
+    messageId?: string;
   };
   resendCount: number;
   lastResendAt?: Date;
-  ipAddress?: string;
-  userAgent?: string;
-  metadata?: Record<string, any>;
 }
 
-export interface OTPStoreOptions {
-  phoneNumber: string;
-  countryCode: string;
-  code: string;
-  expiresAt: Date;
-  maxAttempts: number;
-  deliveryMethod: 'sms' | 'email' | 'both';
-  deliveryInfo: {
-    phoneNumber: string;
-    countryCode: string;
-    email?: string;
-    userName?: string;
-  };
-  ipAddress?: string;
-  userAgent?: string;
-  metadata?: Record<string, any>;
+export interface OTPStoreResult {
+  success: boolean;
+  otpId?: string;
+  error?: string;
 }
 
-export interface OTPStatistics {
-  activeCount: number;
-  expiredCount: number;
-  usedCount: number;
-  dailyGenerated: number;
-  dailyValidated: number;
-  deliveryStats: {
-    sms: { sent: number; failed: number };
-    email: { sent: number; failed: number };
-  };
-}
+// ==============================================
+// OTP STORE CLASS
+// ==============================================
 
 export class OTPStore {
   private static instance: OTPStore;
-  private readonly OTP_CATEGORY = 'otp_storage';
-  private readonly CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
-  private readonly RETENTION_HOURS = 24; // Keep expired OTPs for 24 hours for analytics
+  private readonly OTP_CATEGORY = 'otp_verification';
+  private readonly RETENTION_HOURS = 24; // Keep OTPs for 24 hours max
 
   private constructor() {
-    this.startCleanupTask();
+    // Initialize cleanup interval
+    setInterval(() => {
+      this.cleanupExpiredOTPs();
+    }, TIME_CONSTANTS.HOUR); // Cleanup every hour
   }
 
   static getInstance(): OTPStore {
@@ -90,70 +69,72 @@ export class OTPStore {
     return OTPStore.instance;
   }
 
-  // Store OTP in database
-  async storeOTP(options: OTPStoreOptions): Promise<{
-    success: boolean;
-    otpId?: string;
-    error?: string;
-  }> {
+  // ==============================================
+  // MAIN STORE METHODS
+  // ==============================================
+
+  // Store OTP with method support
+  async storeOTP(
+    identifier: string,
+    method: 'phone' | 'email',
+    otpCode: string,
+    expiresAt: Date,
+    maxAttempts: number,
+    deliveryInfo: OTPDeliveryInfo
+  ): Promise<OTPStoreResult> {
     try {
       await connectDB();
 
-      // Generate unique OTP ID
       const otpId = this.generateOTPId();
+      const otpKey = this.getOTPKey(identifier, method);
 
-      // Hash the OTP code for security
-      const hashedCode = await EncryptionService.hashPassword(options.code);
-
-      // Create stored OTP object
-      const storedOTP: StoredOTP = {
+      const otpData = {
         id: otpId,
-        phoneNumber: options.phoneNumber,
-        countryCode: options.countryCode,
-        code: options.code, // Store plaintext temporarily for verification
-        hashedCode,
-        createdAt: new Date(),
-        expiresAt: options.expiresAt,
+        code: otpCode,
+        identifier,
+        method,
+        expiresAt,
+        attempts: 0,
+        maxAttempts,
         isUsed: false,
         isExpired: false,
-        attempts: 0,
-        maxAttempts: options.maxAttempts,
-        deliveryMethod: options.deliveryMethod,
-        deliveryInfo: options.deliveryInfo,
-        deliveryStatus: {},
-        resendCount: 0,
-        ipAddress: options.ipAddress,
-        userAgent: options.userAgent,
-        metadata: options.metadata || {}
+        createdAt: new Date(),
+        deliveryInfo,
+        deliveryMethod: method,
+        deliveryStatus: {
+          sent: false
+        },
+        resendCount: 0
       };
 
-      // Store in database using phone number as key
+      // Store in database
       await Settings.findOneAndUpdate(
         { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(options.phoneNumber) 
+          category: this.OTP_CATEGORY,
+          key: otpKey
         },
         {
-          value: storedOTP,
+          category: this.OTP_CATEGORY,
+          key: otpKey,
+          value: otpData,
           type: 'object',
-          description: `OTP for phone ${this.maskPhoneNumber(options.phoneNumber)}`,
-          isEncrypted: true,
+          description: `OTP for ${method}: ${this.maskIdentifier(identifier, method)}`,
           isPublic: false,
-          updatedBy: 'system'
+          expiresAt
         },
         { upsert: true, new: true }
       );
 
-      // Track storage analytics
+      // Track storage
       await analyticsTracker.trackFeatureUsage(
         'system',
         'otp_store',
-        'stored',
+        'otp_stored',
         {
+          identifier: this.maskIdentifier(identifier, method),
+          method,
           otpId,
-          phoneNumber: this.maskPhoneNumber(options.phoneNumber),
-          deliveryMethod: options.deliveryMethod,
-          expiryMinutes: Math.round((options.expiresAt.getTime() - Date.now()) / 60000)
+          expiryMinutes: Math.round((expiresAt.getTime() - Date.now()) / (1000 * 60))
         }
       );
 
@@ -166,7 +147,8 @@ export class OTPStore {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_store',
         action: 'store_otp',
-        phoneNumber: this.maskPhoneNumber(options.phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -176,50 +158,58 @@ export class OTPStore {
     }
   }
 
-  // Retrieve OTP from database
-  async getOTP(phoneNumber: string): Promise<StoredOTP | null> {
+  // Get stored OTP
+  async getOTP(identifier: string, method: 'phone' | 'email'): Promise<StoredOTP | null> {
     try {
       await connectDB();
 
+      const otpKey = this.getOTPKey(identifier, method);
       const setting = await Settings.findOne({
         category: this.OTP_CATEGORY,
-        key: this.getOTPKey(phoneNumber)
+        key: otpKey
       });
 
-      if (!setting?.value) {
+      if (!setting || !setting.value) {
         return null;
       }
 
-      const storedOTP = setting.value as StoredOTP;
-
-      // Check if OTP is expired
+      const otpData = setting.value;
+      
+      // Check if expired
       const now = new Date();
-      if (now > storedOTP.expiresAt) {
-        storedOTP.isExpired = true;
-        // Update expired status in database
-        await this.updateOTPStatus(phoneNumber, { isExpired: true });
-      }
+      const isExpired = now > new Date(otpData.expiresAt);
 
-      return storedOTP;
+      return {
+        ...otpData,
+        expiresAt: new Date(otpData.expiresAt),
+        createdAt: new Date(otpData.createdAt),
+        usedAt: otpData.usedAt ? new Date(otpData.usedAt) : undefined,
+        lastResendAt: otpData.lastResendAt ? new Date(otpData.lastResendAt) : undefined,
+        isExpired
+      };
 
     } catch (error: any) {
-      console.error('Error retrieving OTP:', error);
+      await analyticsTracker.trackError(error, 'system', {
+        component: 'otp_store',
+        action: 'get_otp',
+        method,
+        identifier: this.maskIdentifier(identifier, method)
+      });
+
       return null;
     }
   }
 
   // Mark OTP as used
-  async markOTPAsUsed(phoneNumber: string): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
+  async markOTPAsUsed(identifier: string, method: 'phone' | 'email'): Promise<OTPStoreResult> {
     try {
       await connectDB();
 
+      const otpKey = this.getOTPKey(identifier, method);
       const result = await Settings.findOneAndUpdate(
         { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(phoneNumber) 
+          category: this.OTP_CATEGORY,
+          key: otpKey
         },
         {
           $set: {
@@ -237,13 +227,14 @@ export class OTPStore {
         };
       }
 
-      // Track usage analytics
+      // Track usage
       await analyticsTracker.trackFeatureUsage(
         'system',
         'otp_store',
-        'marked_used',
+        'otp_used',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
+          identifier: this.maskIdentifier(identifier, method),
+          method,
           otpId: result.value.id
         }
       );
@@ -253,8 +244,9 @@ export class OTPStore {
     } catch (error: any) {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_store',
-        action: 'mark_used',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        action: 'mark_otp_used',
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -264,8 +256,55 @@ export class OTPStore {
     }
   }
 
-  // Increment OTP validation attempts
-  async incrementOTPAttempts(phoneNumber: string): Promise<{
+  // Delete OTP
+  async deleteOTP(identifier: string, method: 'phone' | 'email'): Promise<OTPStoreResult> {
+    try {
+      await connectDB();
+
+      const otpKey = this.getOTPKey(identifier, method);
+      const result = await Settings.findOneAndDelete({
+        category: this.OTP_CATEGORY,
+        key: otpKey
+      });
+
+      if (!result) {
+        return {
+          success: false,
+          error: 'OTP not found'
+        };
+      }
+
+      // Track deletion
+      await analyticsTracker.trackFeatureUsage(
+        'system',
+        'otp_store',
+        'otp_deleted',
+        {
+          identifier: this.maskIdentifier(identifier, method),
+          method,
+          otpId: result.value?.id
+        }
+      );
+
+      return { success: true };
+
+    } catch (error: any) {
+      await analyticsTracker.trackError(error, 'system', {
+        component: 'otp_store',
+        action: 'delete_otp',
+        method,
+        identifier: this.maskIdentifier(identifier, method)
+      });
+
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  // Increment attempt count
+  async incrementAttempts(identifier: string, method: 'phone' | 'email'): Promise<{
     success: boolean;
     attempts?: number;
     error?: string;
@@ -273,10 +312,11 @@ export class OTPStore {
     try {
       await connectDB();
 
+      const otpKey = this.getOTPKey(identifier, method);
       const result = await Settings.findOneAndUpdate(
         { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(phoneNumber) 
+          category: this.OTP_CATEGORY,
+          key: otpKey
         },
         {
           $inc: { 'value.attempts': 1 },
@@ -294,13 +334,14 @@ export class OTPStore {
 
       const attempts = result.value.attempts;
 
-      // Track attempt analytics
+      // Track attempt
       await analyticsTracker.trackFeatureUsage(
         'system',
         'otp_store',
         'attempt_incremented',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
+          identifier: this.maskIdentifier(identifier, method),
+          method,
           attempts,
           maxAttempts: result.value.maxAttempts
         }
@@ -315,7 +356,8 @@ export class OTPStore {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_store',
         action: 'increment_attempts',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -325,32 +367,29 @@ export class OTPStore {
     }
   }
 
-  // Update OTP delivery status
+  // Update delivery status
   async updateDeliveryStatus(
-    phoneNumber: string,
-    method: 'sms' | 'email',
+    identifier: string,
+    method: 'phone' | 'email',
     status: {
       sent: boolean;
       sentAt?: Date;
       messageId?: string;
       error?: string;
     }
-  ): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
+  ): Promise<OTPStoreResult> {
     try {
       await connectDB();
 
-      const updateField = `value.deliveryStatus.${method}`;
+      const otpKey = this.getOTPKey(identifier, method);
       const result = await Settings.findOneAndUpdate(
         { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(phoneNumber) 
+          category: this.OTP_CATEGORY,
+          key: otpKey
         },
         {
           $set: {
-            [updateField]: {
+            'value.deliveryStatus': {
               ...status,
               sentAt: status.sentAt || new Date()
             }
@@ -366,13 +405,13 @@ export class OTPStore {
         };
       }
 
-      // Track delivery analytics
+      // Track delivery
       await analyticsTracker.trackFeatureUsage(
         'system',
         'otp_store',
         'delivery_status_updated',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
+          identifier: this.maskIdentifier(identifier, method),
           method,
           sent: status.sent,
           hasError: !!status.error
@@ -385,7 +424,8 @@ export class OTPStore {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_store',
         action: 'update_delivery_status',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -396,10 +436,7 @@ export class OTPStore {
   }
 
   // Mark delivery as failed
-  async markOTPDeliveryFailed(otpId: string, error: string): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
+  async markOTPDeliveryFailed(otpId: string, error: string): Promise<OTPStoreResult> {
     try {
       await connectDB();
 
@@ -410,9 +447,9 @@ export class OTPStore {
         },
         {
           $set: {
-            'value.deliveryFailed': true,
-            'value.deliveryError': error,
-            'value.deliveryFailedAt': new Date()
+            'value.deliveryStatus.sent': false,
+            'value.deliveryStatus.error': error,
+            'value.deliveryStatus.sentAt': new Date()
           }
         },
         { new: true }
@@ -432,7 +469,8 @@ export class OTPStore {
         'delivery_failed',
         {
           otpId,
-          error: error.substring(0, 100) // Limit error message length
+          error: error.substring(0, 100),
+          method: result.value.method
         }
       );
 
@@ -446,28 +484,20 @@ export class OTPStore {
     }
   }
 
-  // Update delivery method (for resends)
-  async updateOTPDeliveryMethod(
-    phoneNumber: string,
-    newMethod: 'sms' | 'email' | 'both'
-  ): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
+  // Update resend count
+  async updateOTPResendCount(identifier: string, method: 'phone' | 'email'): Promise<OTPStoreResult> {
     try {
       await connectDB();
 
+      const otpKey = this.getOTPKey(identifier, method);
       const result = await Settings.findOneAndUpdate(
         { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(phoneNumber) 
+          category: this.OTP_CATEGORY,
+          key: otpKey
         },
         {
-          $set: {
-            'value.deliveryMethod': newMethod,
-            'value.lastResendAt': new Date()
-          },
-          $inc: { 'value.resendCount': 1 }
+          $inc: { 'value.resendCount': 1 },
+          $set: { 'value.lastResendAt': new Date() }
         },
         { new: true }
       );
@@ -489,117 +519,57 @@ export class OTPStore {
     }
   }
 
-  // Delete OTP from database
-  async deleteOTP(phoneNumber: string): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
-    try {
-      await connectDB();
-
-      const result = await Settings.deleteOne({
-        category: this.OTP_CATEGORY,
-        key: this.getOTPKey(phoneNumber)
-      });
-
-      // Track deletion
-      await analyticsTracker.trackFeatureUsage(
-        'system',
-        'otp_store',
-        'deleted',
-        {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
-          found: result.deletedCount > 0
-        }
-      );
-
-      return { success: true };
-
-    } catch (error: any) {
-      await analyticsTracker.trackError(error, 'system', {
-        component: 'otp_store',
-        action: 'delete_otp',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
-      });
-
-      return {
-        success: false,
-        error: error.message
-      };
-    }
-  }
-
-  // Update OTP status (generic method)
-  private async updateOTPStatus(
-    phoneNumber: string,
-    updates: Partial<StoredOTP>
-  ): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
-    try {
-      await connectDB();
-
-      const updateFields: Record<string, any> = {};
-      Object.keys(updates).forEach(key => {
-        updateFields[`value.${key}`] = updates[key as keyof StoredOTP];
-      });
-
-      await Settings.findOneAndUpdate(
-        { 
-          category: this.OTP_CATEGORY, 
-          key: this.getOTPKey(phoneNumber) 
-        },
-        { $set: updateFields },
-        { new: true }
-      );
-
-      return { success: true };
-
-    } catch (error: any) {
-      return {
-        success: false,
-        error: error.message
-      };
-    }
-  }
+  // ==============================================
+  // STATISTICS AND MONITORING
+  // ==============================================
 
   // Get OTP statistics
-  async getStatistics(): Promise<OTPStatistics> {
+  async getOTPStatistics(): Promise<{
+    activeCount: number;
+    expiredCount: number;
+    usedCount: number;
+    dailyGenerated: number;
+    dailyValidated: number;
+    methodBreakdown: {
+      phone: { active: number; used: number };
+      email: { active: number; used: number };
+    };
+  }> {
     try {
       await connectDB();
 
       const now = new Date();
-      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const startOfDay = new Date(now);
+      startOfDay.setHours(0, 0, 0, 0);
 
-      // Get all OTP records
-      const otpRecords = await Settings.find({
+      const otps = await Settings.find({
         category: this.OTP_CATEGORY
-      });
+      }).lean();
 
-      const stats: OTPStatistics = {
+      const stats = {
         activeCount: 0,
         expiredCount: 0,
         usedCount: 0,
         dailyGenerated: 0,
         dailyValidated: 0,
-        deliveryStats: {
-          sms: { sent: 0, failed: 0 },
-          email: { sent: 0, failed: 0 }
+        methodBreakdown: {
+          phone: { active: 0, used: 0 },
+          email: { active: 0, used: 0 }
         }
       };
 
-      otpRecords.forEach(record => {
-        const otp = record.value as StoredOTP;
+      otps.forEach(setting => {
+        const otp = setting.value;
         const createdAt = new Date(otp.createdAt);
+        const expiresAt = new Date(otp.expiresAt);
 
         // Count by status
         if (otp.isUsed) {
           stats.usedCount++;
-          if (createdAt >= startOfDay) {
+          if (otp.usedAt && new Date(otp.usedAt) >= startOfDay) {
             stats.dailyValidated++;
           }
-        } else if (otp.isExpired || now > new Date(otp.expiresAt)) {
+        } else if (now > expiresAt) {
           stats.expiredCount++;
         } else {
           stats.activeCount++;
@@ -610,20 +580,18 @@ export class OTPStore {
           stats.dailyGenerated++;
         }
 
-        // Delivery statistics
-        if (otp.deliveryStatus.sms) {
-          if (otp.deliveryStatus.sms.sent) {
-            stats.deliveryStats.sms.sent++;
-          } else {
-            stats.deliveryStats.sms.failed++;
+        // Method breakdown
+        if (otp.method === 'phone') {
+          if (otp.isUsed) {
+            stats.methodBreakdown.phone.used++;
+          } else if (now <= expiresAt) {
+            stats.methodBreakdown.phone.active++;
           }
-        }
-
-        if (otp.deliveryStatus.email) {
-          if (otp.deliveryStatus.email.sent) {
-            stats.deliveryStats.email.sent++;
-          } else {
-            stats.deliveryStats.email.failed++;
+        } else if (otp.method === 'email') {
+          if (otp.isUsed) {
+            stats.methodBreakdown.email.used++;
+          } else if (now <= expiresAt) {
+            stats.methodBreakdown.email.active++;
           }
         }
       });
@@ -638,9 +606,9 @@ export class OTPStore {
         usedCount: 0,
         dailyGenerated: 0,
         dailyValidated: 0,
-        deliveryStats: {
-          sms: { sent: 0, failed: 0 },
-          email: { sent: 0, failed: 0 }
+        methodBreakdown: {
+          phone: { active: 0, used: 0 },
+          email: { active: 0, used: 0 }
         }
       };
     }
@@ -693,7 +661,36 @@ export class OTPStore {
     }
   }
 
-  // Private helper methods
+  // Get all active OTPs (for debugging)
+  async getAllActiveOTPs(): Promise<StoredOTP[]> {
+    try {
+      await connectDB();
+
+      const now = new Date();
+      const settings = await Settings.find({
+        category: this.OTP_CATEGORY
+      }).lean();
+
+      return settings
+        .map(setting => ({
+          ...setting.value,
+          expiresAt: new Date(setting.value.expiresAt),
+          createdAt: new Date(setting.value.createdAt),
+          usedAt: setting.value.usedAt ? new Date(setting.value.usedAt) : undefined,
+          lastResendAt: setting.value.lastResendAt ? new Date(setting.value.lastResendAt) : undefined,
+          isExpired: now > new Date(setting.value.expiresAt)
+        }))
+        .filter(otp => !otp.isUsed && !otp.isExpired);
+
+    } catch (error) {
+      console.error('Error getting all active OTPs:', error);
+      return [];
+    }
+  }
+
+  // ==============================================
+  // PRIVATE HELPER METHODS
+  // ==============================================
 
   // Generate unique OTP ID
   private generateOTPId(): string {
@@ -701,76 +698,44 @@ export class OTPStore {
   }
 
   // Generate OTP storage key
-  private getOTPKey(phoneNumber: string): string {
-    // Use hash of phone number for privacy
-    return `otp_${EncryptionService.hash(phoneNumber).substring(0, 16)}`;
+  private getOTPKey(identifier: string, method: 'phone' | 'email'): string {
+    // Create a hash-based key for privacy and consistency
+    const combinedKey = `${method}:${identifier}`;
+    return `otp_${EncryptionService.hash(combinedKey).substring(0, 16)}`;
+  }
+
+  // Mask identifier for logging
+  private maskIdentifier(identifier: string, method: 'phone' | 'email'): string {
+    if (method === 'phone') {
+      return this.maskPhoneNumber(identifier);
+    } else {
+      return this.maskEmail(identifier);
+    }
   }
 
   // Mask phone number for logging
   private maskPhoneNumber(phoneNumber: string): string {
     if (phoneNumber.length <= 4) return phoneNumber;
     const visibleDigits = 2;
-    const start = phoneNumber.substring(0, visibleDigits);
+    const start = phoneNumber.substring(0, visibleDigits + 1); // Include country code +
     const end = phoneNumber.substring(phoneNumber.length - visibleDigits);
-    const masked = '*'.repeat(phoneNumber.length - (visibleDigits * 2));
-    return start + masked + end;
+    const masked = '*'.repeat(phoneNumber.length - (visibleDigits * 2) - 1);
+    return `${start}${masked}${end}`;
   }
 
-  // Start cleanup task
-  private startCleanupTask(): void {
-    setInterval(async () => {
-      try {
-        await this.cleanupExpiredOTPs();
-        console.log('OTP cleanup task completed');
-      } catch (error) {
-        console.error('Error in OTP cleanup task:', error);
-      }
-    }, this.CLEANUP_INTERVAL);
-
-    // Run initial cleanup
-    setTimeout(() => {
-      this.cleanupExpiredOTPs();
-    }, 5000); // Wait 5 seconds after startup
-  }
-
-  // Get all active OTPs (for admin purposes)
-  async getAllActiveOTPs(): Promise<StoredOTP[]> {
-    try {
-      await connectDB();
-
-      const settings = await Settings.find({
-        category: this.OTP_CATEGORY
-      });
-
-      const now = new Date();
-      return settings
-        .map(setting => setting.value as StoredOTP)
-        .filter(otp => !otp.isUsed && !otp.isExpired && now <= new Date(otp.expiresAt));
-
-    } catch (error) {
-      console.error('Error getting active OTPs:', error);
-      return [];
+  // Mask email for logging
+  private maskEmail(email: string): string {
+    const [local, domain] = email.split('@');
+    if (local.length <= 3) {
+      return `${local[0]}***@${domain}`;
     }
-  }
-
-  // Get OTP by ID (for admin purposes)
-  async getOTPById(otpId: string): Promise<StoredOTP | null> {
-    try {
-      await connectDB();
-
-      const setting = await Settings.findOne({
-        category: this.OTP_CATEGORY,
-        'value.id': otpId
-      });
-
-      return setting?.value as StoredOTP || null;
-
-    } catch (error) {
-      console.error('Error getting OTP by ID:', error);
-      return null;
-    }
+    const maskedLocal = local.substring(0, 3) + '*'.repeat(Math.max(0, local.length - 3));
+    return `${maskedLocal}@${domain}`;
   }
 }
 
-// Export singleton instance
+// ==============================================
+// EXPORT SINGLETON INSTANCE
+// ==============================================
+
 export const otpStore = OTPStore.getInstance();

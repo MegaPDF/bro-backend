@@ -13,7 +13,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
     await connectDB();
 
-    // Parse and validate request body
     const body = await request.json();
     const validation = sendOTPSchema.safeParse(body);
 
@@ -27,31 +26,44 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       } as APIResponse, { status: 400 });
     }
 
-    const { phoneNumber, countryCode } = validation.data;
+    const { method, phoneNumber, countryCode, email } = validation.data;
 
-    // Rate limiting check (basic implementation)
-    const clientIp = request.headers.get('x-forwarded-for') || 
-                     request.headers.get('x-real-ip') || 
-                     'unknown';
+    // Determine identifier and delivery info based on method
+    let identifier: string;
+    let deliveryInfo: OTPDeliveryInfo;
 
-    // Check if user exists (for analytics purposes)
-    const existingUser = await User.findOne({ phoneNumber, countryCode });
-    const isExistingUser = !!existingUser;
+    if (method === 'phone') {
+      identifier = phoneNumber!;
+      deliveryInfo = {
+        method: 'phone',
+        phoneNumber: phoneNumber!,
+        countryCode: countryCode!
+      };
+    } else {
+      identifier = email!;
+      deliveryInfo = {
+        method: 'email',
+        email: email!
+      };
+    }
+
+    // Check if user exists (for analytics and user name)
+    const existingUser = await (method === 'phone' 
+      ? User.findOne({ phoneNumber, countryCode })
+      : User.findOne({ email }));
+    
+    if (existingUser) {
+      deliveryInfo.userName = existingUser.displayName;
+    }
 
     // Generate and send OTP
-    const deliveryInfo: OTPDeliveryInfo = {
-  phoneNumber,
-  countryCode,
-  userName: existingUser?.displayName
-};
-
     const otpResult = await otpService.generateOTP(
-      phoneNumber,
-      countryCode,
+      identifier,
+      method,
       deliveryInfo,
       {
         maxAttempts: OTP_CONFIG.MAX_ATTEMPTS,
-        deliveryMethod: 'sms'
+        method
       }
     );
 
@@ -61,10 +73,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         'otp',
         'send_failed',
         {
-          phoneNumber: otpService.maskPhoneNumber(phoneNumber),
+          identifier: method === 'phone' 
+            ? otpService.maskPhoneNumber(phoneNumber!) 
+            : email!.replace(/(.{3}).*@/, '$1***@'),
+          method,
           reason: otpResult.error,
-          isExistingUser,
-          clientIp
+          isExistingUser: !!existingUser
         }
       );
 
@@ -76,7 +90,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({
         success: false,
         error: otpResult.error,
-        message: otpResult.error || 'Failed to send OTP',
+        message: otpResult.error || `Failed to send OTP via ${method}`,
         code: otpResult.error,
         timestamp: new Date()
       } as APIResponse, { status: statusCode });
@@ -88,25 +102,28 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       'otp',
       'send_success',
       {
-        phoneNumber: otpService.maskPhoneNumber(phoneNumber),
-        deliveryMethod: 'sms',
-        isExistingUser,
-        clientIp
+        identifier: method === 'phone' 
+          ? otpService.maskPhoneNumber(phoneNumber!) 
+          : email!.replace(/(.{3}).*@/, '$1***@'),
+        method,
+        deliveryMethod: method === 'phone' ? 'sms' : 'email',
+        isExistingUser: !!existingUser
       }
     );
 
     // Create response
     const response: OTPResponse = {
       success: true,
-      message: SUCCESS_MESSAGES.OTP_SENT,
+      message: `OTP sent successfully via ${method}`,
       userId: otpResult.otpId || 'temporary',
-      expiresIn: OTP_CONFIG.EXPIRY_MINUTES * 60 // Convert to seconds
+      expiresIn: OTP_CONFIG.EXPIRY_MINUTES * 60,
+      method // Add method to response
     };
 
     return NextResponse.json({
       success: true,
       data: response,
-      message: SUCCESS_MESSAGES.OTP_SENT,
+      message: `OTP sent successfully via ${method}`,
       timestamp: new Date()
     } as APIResponse<OTPResponse>, { status: 200 });
 

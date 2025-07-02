@@ -64,7 +64,7 @@ if (userId !== 'temporary') {
     }
 
     // Verify OTP
-    const otpResult = await otpService.validateOTP(phoneNumber, otp, {
+    const otpResult = await otpService.validateOTP(phoneNumber, 'phone', otp, {
       deleteOnSuccess: false, // Don't delete yet, might be used for login/register
       userId
     });

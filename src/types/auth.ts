@@ -42,13 +42,6 @@ export interface AuthResponse {
   expiresIn: number;
 }
 
-export interface OTPResponse {
-  success: boolean;
-  message: string;
-  userId: string;
-  expiresIn: number;
-}
-
 export interface QRCodeResponse {
   qrToken: string;
   qrCodeUrl: string;
@@ -66,4 +59,25 @@ export interface JWTPayload {
   deviceId: string;
   iat: number;
   exp: number;
+}
+export interface OTPResponse {
+  success: boolean;
+  message: string;
+  userId: string;
+  expiresIn: number;
+  method: 'phone' | 'email'; // Add this field
+}
+
+export interface SendOTPRequest {
+  method: 'phone' | 'email';
+  phoneNumber?: string;
+  countryCode?: string;
+  email?: string;
+}
+
+export interface VerifyOTPRequest {
+  method: 'phone' | 'email';
+  identifier: string; // phone number or email
+  otp: string;
+  userId: string;
 }

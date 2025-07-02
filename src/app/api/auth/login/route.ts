@@ -31,7 +31,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const { phoneNumber, countryCode, otp } = validation.data;
 
     // Verify OTP
-    const otpResult = await otpService.validateOTP(phoneNumber, otp, {
+    const otpResult = await otpService.validateOTP(phoneNumber, 'phone', otp, {
       deleteOnSuccess: true,
       userId: 'login_attempt'
     });

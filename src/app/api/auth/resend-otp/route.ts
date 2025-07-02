@@ -39,7 +39,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
                      'unknown';
 
     // Resend OTP using the same delivery method
-    const otpResult = await otpService.resendOTP(phoneNumber, 'sms');
+    const otpResult = await otpService.resendOTP(phoneNumber, 'phone');
 
     if (!otpResult.success) {
       await analyticsTracker.trackFeatureUsage(
@@ -86,7 +86,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       success: true,
       message: 'OTP resent successfully',
       userId: otpResult.otpId || 'temporary',
-      expiresIn: OTP_CONFIG.EXPIRY_MINUTES * 60 // Convert to seconds
+      expiresIn: OTP_CONFIG.EXPIRY_MINUTES * 60, // Convert to seconds
+      method: 'phone'
     };
 
     return NextResponse.json({

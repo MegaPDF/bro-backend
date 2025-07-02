@@ -5,7 +5,7 @@ import Message from '@/lib/db/models/Message';
 import Call from '@/lib/db/models/Call';
 import { DateHelpers, ObjectHelpers } from '@/lib/utils/helpers';
 import { TIME_CONSTANTS } from '@/lib/utils/constants';
-
+import mongoose from 'mongoose';
 export interface TrackingEvent {
   type: 'user_activity' | 'message_volume' | 'call_stats' | 'feature_usage' | 'error_tracking' | 'performance';
   userId?: string;
@@ -51,7 +51,11 @@ export class AnalyticsTracker {
   private batchSize = 100;
   private flushInterval = 30000; // 30 seconds
   private isFlushingBatch = false;
-
+private isValidObjectId(id: string): boolean {
+  // Check if the string is a valid MongoDB ObjectId format
+  // Must be 24 character hex string
+  return mongoose.Types.ObjectId.isValid(id) && (id.length === 24);
+}
   constructor() {
     // Auto-flush events periodically
     setInterval(() => {
@@ -288,43 +292,54 @@ export class AnalyticsTracker {
   }
 
   // Aggregate events by time period
-  private aggregateEvents(events: TrackingEvent[]): Partial<IAnalytics>[] {
-    const aggregated = new Map<string, Partial<IAnalytics>>();
+ private aggregateEvents(events: TrackingEvent[]): Partial<IAnalytics>[] {
+  const aggregated = new Map<string, Partial<IAnalytics>>();
 
-    events.forEach(event => {
-      const hourKey = this.getHourKey(event.timestamp || new Date());
-      const key = `${event.type}_${hourKey}_${event.userId || 'anonymous'}_${event.chatId || ''}_${event.groupId || ''}`;
+  events.forEach(event => {
+    const hourKey = this.getHourKey(event.timestamp || new Date());
+    const key = `${event.type}_${hourKey}_${event.userId || 'anonymous'}_${event.chatId || ''}_${event.groupId || ''}`;
 
-      if (!aggregated.has(key)) {
-        aggregated.set(key, {
-          type: event.type as any,
-          date: new Date(hourKey),
-          data: event.data,
-          dimensions: {
-            userId: event.userId ? new (require('mongoose').Types.ObjectId)(event.userId) : undefined,
-            chatId: event.chatId ? new (require('mongoose').Types.ObjectId)(event.chatId) : undefined,
-            groupId: event.groupId ? new (require('mongoose').Types.ObjectId)(event.groupId) : undefined,
-            ...event.dimensions
-          },
-          metrics: {}
-        });
-      }
+    if (!aggregated.has(key)) {
+      aggregated.set(key, {
+        type: event.type as any,
+        date: new Date(hourKey),
+        data: event.data,
+        dimensions: {
+          // Only convert to ObjectId if it's a valid ObjectId format
+          userId: event.userId && this.isValidObjectId(event.userId) 
+            ? new mongoose.Types.ObjectId(event.userId) 
+            : undefined,
+          chatId: event.chatId && this.isValidObjectId(event.chatId) 
+            ? new mongoose.Types.ObjectId(event.chatId) 
+            : undefined,
+          groupId: event.groupId && this.isValidObjectId(event.groupId) 
+            ? new mongoose.Types.ObjectId(event.groupId) 
+            : undefined,
+          // Store non-ObjectId user identifiers as strings
+          userType: event.userId && !this.isValidObjectId(event.userId) 
+            ? event.userId 
+            : undefined,
+          ...event.dimensions
+        },
+        metrics: {}
+      });
+    }
 
-      const existing = aggregated.get(key)!;
-      
-      // Aggregate metrics
-      if (event.metrics) {
-        Object.keys(event.metrics).forEach(metric => {
-          existing.metrics![metric] = (existing.metrics![metric] || 0) + event.metrics![metric];
-        });
-      }
+    const existing = aggregated.get(key)!;
+    
+    // Aggregate metrics
+    if (event.metrics) {
+      Object.keys(event.metrics).forEach(metric => {
+        existing.metrics![metric] = (existing.metrics![metric] || 0) + event.metrics![metric];
+      });
+    }
 
-      // Merge data
-      existing.data = { ...existing.data, ...event.data };
-    });
+    // Merge data
+    existing.data = { ...existing.data, ...event.data };
+  });
 
-    return Array.from(aggregated.values());
-  }
+  return Array.from(aggregated.values());
+}
 
   // Get hour key for aggregation
   private getHourKey(date: Date): string {

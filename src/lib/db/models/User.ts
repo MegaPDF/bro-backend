@@ -7,6 +7,7 @@ export interface IUser extends Document {
   username?: string;
   displayName: string;
   email?: string;
+  emailVerified?: boolean;
   avatar?: string;
   about?: string;
   isVerified: boolean;

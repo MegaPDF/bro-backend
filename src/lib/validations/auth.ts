@@ -22,39 +22,85 @@ export const otpSchema = z.object({
 
 // Registration schema
 export const registerSchema = z.object({
+  method: z.enum(['phone', 'email']),
+  
+  // Phone registration
   phoneNumber: z.string()
-    .regex(REGEX_PATTERNS.PHONE_NUMBER, 'Invalid phone number format'),
+    .regex(/^\+[1-9]\d{1,14}$/, 'Invalid phone number format')
+    .optional(),
   countryCode: z.string()
     .min(1, 'Country code required')
-    .max(4, 'Country code too long'),
+    .max(4, 'Country code too long')
+    .optional(),
+    
+  // Email registration
+  email: z.string()
+    .email('Invalid email format')
+    .optional(),
+    
+  // Common fields
   displayName: z.string()
     .min(1, 'Display name is required')
     .max(50, 'Display name must be less than 50 characters')
     .trim(),
-  email: z.string()
-    .email('Invalid email format')
-    .optional()
-    .or(z.literal('')),
   username: z.string()
-    .regex(REGEX_PATTERNS.USERNAME, 'Username must be 3-30 characters, letters, numbers, dots and underscores only')
+    .regex(/^[a-zA-Z0-9._]{3,30}$/, 'Username must be 3-30 characters, letters, numbers, dots and underscores only')
     .optional()
-    .or(z.literal(''))
+}).refine((data) => {
+  if (data.method === 'phone') {
+    return data.phoneNumber && data.countryCode;
+  } else if (data.method === 'email') {
+    return data.email;
+  }
+  return false;
+}, {
+  message: 'Phone and country code required for phone method, email required for email method'
 });
-
 // Login schema
 export const loginSchema = phoneNumberSchema.merge(otpSchema);
 
 // Send OTP schema
-export const sendOTPSchema = phoneNumberSchema;
+export const sendOTPSchema = z.object({
+  // Method selection
+  method: z.enum(['phone', 'email'], {
+    errorMap: () => ({ message: 'Authentication method must be either phone or email' })
+  }),
+  
+  // Phone fields (required if method is phone)
+  phoneNumber: z.string()
+    .regex(/^\+[1-9]\d{1,14}$/, 'Invalid phone number format')
+    .optional(),
+  countryCode: z.string()
+    .min(1, 'Country code required')
+    .max(4, 'Country code too long')
+    .optional(),
+    
+  // Email field (required if method is email)
+  email: z.string()
+    .email('Invalid email format')
+    .optional()
+}).refine((data) => {
+  // Validate based on selected method
+  if (data.method === 'phone') {
+    return data.phoneNumber && data.countryCode;
+  } else if (data.method === 'email') {
+    return data.email;
+  }
+  return false;
+}, {
+  message: 'Phone number and country code required for phone method, email required for email method'
+});
 
 // Verify OTP schema
 export const verifyOTPSchema = z.object({
-  userId: z.string()
-    .min(1, 'User ID required'),
+  method: z.enum(['phone', 'email']),
+  identifier: z.string().min(1, 'Identifier required'), // phone number or email
   otp: z.string()
-    .length(OTP_CONFIG.LENGTH, `OTP must be ${OTP_CONFIG.LENGTH} digits`)
-    .regex(REGEX_PATTERNS.OTP, 'OTP must contain only digits')
+    .length(6, 'OTP must be 6 digits')
+    .regex(/^\d{6}$/, 'OTP must contain only digits'),
+  userId: z.string().min(1, 'User ID required')
 });
+
 
 // Resend OTP schema
 export const resendOTPSchema = z.object({

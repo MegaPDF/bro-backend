@@ -1,11 +1,24 @@
-import { OTPStore } from './otp-store';
-import { OTPRateLimiter } from './rate-limiter';
+// ==============================================
+// COMPLETE OTP SERVICE IMPLEMENTATION
+// Phone & Email Authentication System
+// ==============================================
+
+// File: src/lib/services/otp/otp-service.ts
+
 import { connectDB } from '@/lib/db/connection';
-import User from '@/lib/db/models/User';
+import User, { IUser } from '@/lib/db/models/User';
 import { analyticsTracker } from '../analytics/tracker';
 import { emailService } from '../email/sendEmail';
-import { OTP_CONFIG, ERROR_CODES, SUCCESS_MESSAGES } from '@/lib/utils/constants';
+import { OTPStore } from './otp-store';
+import { OTPRateLimiter } from './rate-limiter';
 import { EncryptionService } from '@/lib/utils/encryption';
+import { OTP_CONFIG, ERROR_CODES, SUCCESS_MESSAGES } from '@/lib/utils/constants';
+import mongoose from 'mongoose';
+import { twilioSMSService } from '../sms/twilio';
+
+// ==============================================
+// INTERFACES AND TYPES
+// ==============================================
 
 export interface OTPGenerationResult {
   success: boolean;
@@ -30,15 +43,32 @@ export interface OTPOptions {
   maxAttempts?: number;
   resendCooldownSeconds?: number;
   type?: 'numeric' | 'alphanumeric';
-  deliveryMethod?: 'sms' | 'email' | 'both';
 }
 
 export interface OTPDeliveryInfo {
-  phoneNumber: string;
-  countryCode: string;
+  method: 'phone' | 'email';
+  phoneNumber?: string;
+  countryCode?: string;
   email?: string;
   userName?: string;
 }
+
+export interface OTPGenerationOptions extends OTPOptions {
+  method: 'phone' | 'email';
+}
+
+export interface OTPStatusInfo {
+  hasActiveOTP: boolean;
+  method?: 'phone' | 'email';
+  identifier?: string;
+  expiresAt?: Date;
+  attemptsRemaining?: number;
+  deliveryMethod?: string;
+}
+
+// ==============================================
+// MAIN OTP SERVICE CLASS
+// ==============================================
 
 export class OTPService {
   private static instance: OTPService;
@@ -57,12 +87,15 @@ export class OTPService {
     return OTPService.instance;
   }
 
-  // Generate and send OTP for phone verification
+  // ==============================================
+  // MAIN OTP GENERATION METHOD
+  // ==============================================
+
   async generateOTP(
-    phoneNumber: string,
-    countryCode: string,
+    identifier: string, // phone number or email
+    method: 'phone' | 'email',
     deliveryInfo: OTPDeliveryInfo,
-    options: OTPOptions = {}
+    options: OTPGenerationOptions
   ): Promise<OTPGenerationResult> {
     try {
       // Apply default options
@@ -71,14 +104,22 @@ export class OTPService {
         expiryMinutes: options.expiryMinutes || OTP_CONFIG.EXPIRY_MINUTES,
         maxAttempts: options.maxAttempts || OTP_CONFIG.MAX_ATTEMPTS,
         resendCooldownSeconds: options.resendCooldownSeconds || OTP_CONFIG.RESEND_COOLDOWN_SECONDS,
-        type: options.type || 'numeric',
-        deliveryMethod: options.deliveryMethod || 'sms'
+        type: options.type || 'numeric'
       };
+
+      // Validate input based on method
+      const validationResult = this.validateInput(identifier, method, deliveryInfo);
+      if (!validationResult.isValid) {
+        return {
+          success: false,
+          error: validationResult.error
+        };
+      }
 
       // Check rate limiting
       const rateLimitResult = await this.rateLimiter.checkGenerationLimit(
-        phoneNumber,
-        deliveryInfo.email
+        identifier,
+        method
       );
 
       if (!rateLimitResult.allowed) {
@@ -87,7 +128,8 @@ export class OTPService {
           'otp',
           'generation_rate_limited',
           { 
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
+            identifier: this.maskIdentifier(identifier, method),
+            method,
             cooldownSeconds: rateLimitResult.cooldownSeconds
           }
         );
@@ -99,34 +141,19 @@ export class OTPService {
         };
       }
 
-      // Check if there's an active OTP for this phone number
-      const existingOTP = await this.otpStore.getOTP(phoneNumber);
-      if (existingOTP && !existingOTP.isExpired && !existingOTP.isUsed) {
-        const resendAllowed = await this.rateLimiter.checkResendLimit(phoneNumber);
-        
-        if (!resendAllowed.allowed) {
-          return {
-            success: false,
-            error: 'Please wait before requesting another OTP',
-            cooldownSeconds: resendAllowed.cooldownSeconds
-          };
-        }
-      }
-
       // Generate OTP code
       const otpCode = this.generateOTPCode(otpOptions.length, otpOptions.type);
       const expiresAt = new Date(Date.now() + otpOptions.expiryMinutes * 60 * 1000);
 
       // Store OTP
-      const storeResult = await this.otpStore.storeOTP({
-        phoneNumber,
-        countryCode,
-        code: otpCode,
+      const storeResult = await this.otpStore.storeOTP(
+        identifier,
+        method,
+        otpCode,
         expiresAt,
-        maxAttempts: otpOptions.maxAttempts,
-        deliveryMethod: otpOptions.deliveryMethod,
+        otpOptions.maxAttempts,
         deliveryInfo
-      });
+      );
 
       if (!storeResult.success) {
         return {
@@ -135,14 +162,14 @@ export class OTPService {
         };
       }
 
-      // Update user with temporary OTP (for backward compatibility)
-      await this.updateUserTempOTP(phoneNumber, countryCode, otpCode, expiresAt);
+      // Update user temporary OTP (if user exists)
+      await this.updateUserTempOTP(identifier, method, otpCode, expiresAt);
 
-      // Send OTP via specified delivery method
+      // Send OTP via specified method
       const deliveryResult = await this.deliverOTP(
         otpCode,
         deliveryInfo,
-        otpOptions.deliveryMethod
+        method
       );
 
       if (!deliveryResult.success) {
@@ -161,8 +188,9 @@ export class OTPService {
         'otp',
         'generated',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
-          deliveryMethod: otpOptions.deliveryMethod,
+          identifier: this.maskIdentifier(identifier, method),
+          method,
+          deliveryMethod: method,
           length: otpOptions.length,
           expiryMinutes: otpOptions.expiryMinutes
         }
@@ -178,7 +206,8 @@ export class OTPService {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_service',
         action: 'generate_otp',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -188,67 +217,38 @@ export class OTPService {
     }
   }
 
-  // Validate OTP code
+  // ==============================================
+  // OTP VALIDATION METHOD
+  // ==============================================
+
   async validateOTP(
-    phoneNumber: string,
+    identifier: string,
+    method: 'phone' | 'email',
     otpCode: string,
-    options: { 
-      deleteOnSuccess?: boolean;
-      userId?: string;
-    } = {}
+    options: { deleteOnSuccess?: boolean; userId?: string } = {}
   ): Promise<OTPValidationResult> {
     try {
-      const deleteOnSuccess = options.deleteOnSuccess !== false; // Default to true
-
-      // Check rate limiting for validation attempts
-      const rateLimitResult = await this.rateLimiter.checkValidationLimit(phoneNumber);
-      if (!rateLimitResult.allowed) {
-        await analyticsTracker.trackFeatureUsage(
-          options.userId || 'system',
-          'otp',
-          'validation_rate_limited',
-          {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
-            lockedUntil: rateLimitResult.lockedUntil
-          }
-        );
-
-        return {
-          success: false,
-          error: ERROR_CODES.RATE_LIMIT_EXCEEDED,
-          lockedUntil: rateLimitResult.lockedUntil
-        };
-      }
-
       // Get stored OTP
-      const storedOTP = await this.otpStore.getOTP(phoneNumber);
+      const storedOTP = await this.otpStore.getOTP(identifier, method);
+      
       if (!storedOTP) {
-        await analyticsTracker.trackFeatureUsage(
-          options.userId || 'system',
-          'otp',
-          'validation_failed',
-          {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
-            reason: 'otp_not_found'
-          }
-        );
-
         return {
           success: false,
           error: ERROR_CODES.INVALID_OTP
         };
       }
 
-      // Check if OTP is expired
-      if (storedOTP.isExpired) {
-        await this.otpStore.deleteOTP(phoneNumber);
+      // Check if OTP has expired
+      if (storedOTP.isExpired || new Date() > storedOTP.expiresAt) {
+        await this.otpStore.deleteOTP(identifier, method);
         
         await analyticsTracker.trackFeatureUsage(
           options.userId || 'system',
           'otp',
           'validation_failed',
           {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
+            identifier: this.maskIdentifier(identifier, method),
+            method,
             reason: 'expired'
           }
         );
@@ -259,52 +259,34 @@ export class OTPService {
         };
       }
 
-      // Check if OTP is already used
-      if (storedOTP.isUsed) {
-        await analyticsTracker.trackFeatureUsage(
-          options.userId || 'system',
-          'otp',
-          'validation_failed',
-          {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
-            reason: 'already_used'
-          }
-        );
-
-        return {
-          success: false,
-          error: ERROR_CODES.INVALID_OTP
-        };
-      }
-
-      // Check if max attempts exceeded
+      // Check if too many attempts
       if (storedOTP.attempts >= storedOTP.maxAttempts) {
-        await this.otpStore.markOTPAsUsed(phoneNumber);
+        await this.otpStore.deleteOTP(identifier, method);
         
         await analyticsTracker.trackFeatureUsage(
           options.userId || 'system',
           'otp',
           'validation_failed',
           {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
+            identifier: this.maskIdentifier(identifier, method),
+            method,
             reason: 'max_attempts_exceeded'
           }
         );
 
         return {
           success: false,
-          error: ERROR_CODES.OTP_MAX_ATTEMPTS,
-          attemptsRemaining: 0
+          error: ERROR_CODES.OTP_MAX_ATTEMPTS
         };
       }
 
-      // Validate OTP code
-      const isValidCode = await this.verifyOTPCode(storedOTP.code, otpCode);
-      
-      // Increment attempts
-      await this.otpStore.incrementOTPAttempts(phoneNumber);
+      // Increment attempt count
+      await this.otpStore.incrementAttempts(identifier, method);
 
-      if (!isValidCode) {
+      // Verify OTP code with timing-safe comparison
+      const isValid = await this.verifyOTPCode(storedOTP.code, otpCode);
+      
+      if (!isValid) {
         const attemptsRemaining = storedOTP.maxAttempts - (storedOTP.attempts + 1);
         
         await analyticsTracker.trackFeatureUsage(
@@ -312,7 +294,8 @@ export class OTPService {
           'otp',
           'validation_failed',
           {
-            phoneNumber: this.maskPhoneNumber(phoneNumber),
+            identifier: this.maskIdentifier(identifier, method),
+            method,
             reason: 'invalid_code',
             attemptsRemaining
           }
@@ -326,15 +309,15 @@ export class OTPService {
       }
 
       // OTP is valid - mark as used if requested
-      if (deleteOnSuccess) {
-        await this.otpStore.markOTPAsUsed(phoneNumber);
+      if (options.deleteOnSuccess) {
+        await this.otpStore.markOTPAsUsed(identifier, method);
       }
 
       // Clear user temporary OTP
-      await this.clearUserTempOTP(phoneNumber);
+      await this.clearUserTempOTP(identifier, method);
 
       // Check if this is a new user registration
-      const existingUser = await this.findUserByPhone(phoneNumber);
+      const existingUser = await this.findUserByIdentifier(identifier, method);
       const isNewUser = !existingUser;
 
       // Track successful validation
@@ -343,7 +326,8 @@ export class OTPService {
         'otp',
         'validation_success',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
+          identifier: this.maskIdentifier(identifier, method),
+          method,
           isNewUser,
           deliveryMethod: storedOTP.deliveryMethod
         }
@@ -359,7 +343,8 @@ export class OTPService {
       await analyticsTracker.trackError(error, options.userId || 'system', {
         component: 'otp_service',
         action: 'validate_otp',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -369,23 +354,26 @@ export class OTPService {
     }
   }
 
-  // Resend OTP with same or different delivery method
+  // ==============================================
+  // RESEND OTP METHOD
+  // ==============================================
+
   async resendOTP(
-    phoneNumber: string,
-    deliveryMethod?: 'sms' | 'email' | 'both'
+    identifier: string,
+    method: 'phone' | 'email'
   ): Promise<OTPGenerationResult> {
     try {
       // Get existing OTP
-      const existingOTP = await this.otpStore.getOTP(phoneNumber);
+      const existingOTP = await this.otpStore.getOTP(identifier, method);
       if (!existingOTP) {
         return {
           success: false,
-          error: 'No active OTP found for this phone number'
+          error: 'No active OTP found for this identifier'
         };
       }
 
       // Check resend rate limiting
-      const resendAllowed = await this.rateLimiter.checkResendLimit(phoneNumber);
+      const resendAllowed = await this.rateLimiter.checkResendLimit(identifier, method);
       if (!resendAllowed.allowed) {
         return {
           success: false,
@@ -394,14 +382,11 @@ export class OTPService {
         };
       }
 
-      // Use specified delivery method or fallback to original
-      const targetDeliveryMethod = deliveryMethod || existingOTP.deliveryMethod;
-
-      // Send OTP with new delivery method
+      // Send OTP with same delivery info
       const deliveryResult = await this.deliverOTP(
         existingOTP.code,
         existingOTP.deliveryInfo,
-        targetDeliveryMethod
+        method
       );
 
       if (!deliveryResult.success) {
@@ -411,8 +396,8 @@ export class OTPService {
         };
       }
 
-      // Update delivery method and resend count
-      await this.otpStore.updateOTPDeliveryMethod(phoneNumber, targetDeliveryMethod);
+      // Update resend count
+      await this.otpStore.updateOTPResendCount(identifier, method);
 
       // Track resend
       await analyticsTracker.trackFeatureUsage(
@@ -420,9 +405,9 @@ export class OTPService {
         'otp',
         'resent',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
-          deliveryMethod: targetDeliveryMethod,
-          originalDeliveryMethod: existingOTP.deliveryMethod
+          identifier: this.maskIdentifier(identifier, method),
+          method,
+          deliveryMethod: method
         }
       );
 
@@ -436,7 +421,8 @@ export class OTPService {
       await analyticsTracker.trackError(error, 'system', {
         component: 'otp_service',
         action: 'resend_otp',
-        phoneNumber: this.maskPhoneNumber(phoneNumber)
+        method,
+        identifier: this.maskIdentifier(identifier, method)
       });
 
       return {
@@ -446,21 +432,50 @@ export class OTPService {
     }
   }
 
-  // Cancel active OTP
-  async cancelOTP(phoneNumber: string, reason?: string): Promise<{
+  // ==============================================
+  // GET OTP STATUS METHOD
+  // ==============================================
+
+  async getOTPStatus(identifier: string, method: 'phone' | 'email'): Promise<OTPStatusInfo> {
+    try {
+      const otp = await this.otpStore.getOTP(identifier, method);
+      
+      if (!otp || otp.isExpired || otp.isUsed) {
+        return { hasActiveOTP: false };
+      }
+
+      return {
+        hasActiveOTP: true,
+        method,
+        identifier: this.maskIdentifier(identifier, method),
+        expiresAt: otp.expiresAt,
+        attemptsRemaining: otp.maxAttempts - otp.attempts,
+        deliveryMethod: method
+      };
+    } catch (error) {
+      return { hasActiveOTP: false };
+    }
+  }
+
+  // ==============================================
+  // CANCEL OTP METHOD
+  // ==============================================
+
+  async cancelOTP(identifier: string, method: 'phone' | 'email', reason?: string): Promise<{
     success: boolean;
     error?: string;
   }> {
     try {
-      await this.otpStore.deleteOTP(phoneNumber);
-      await this.clearUserTempOTP(phoneNumber);
+      await this.otpStore.deleteOTP(identifier, method);
+      await this.clearUserTempOTP(identifier, method);
 
       await analyticsTracker.trackFeatureUsage(
         'system',
         'otp',
         'cancelled',
         {
-          phoneNumber: this.maskPhoneNumber(phoneNumber),
+          identifier: this.maskIdentifier(identifier, method),
+          method,
           reason: reason || 'user_request'
         }
       );
@@ -474,32 +489,56 @@ export class OTPService {
     }
   }
 
-  // Get OTP status
-  async getOTPStatus(phoneNumber: string): Promise<{
-    hasActiveOTP: boolean;
-    expiresAt?: Date;
-    attemptsRemaining?: number;
-    deliveryMethod?: string;
-  }> {
-    try {
-      const otp = await this.otpStore.getOTP(phoneNumber);
-      
-      if (!otp || otp.isExpired || otp.isUsed) {
-        return { hasActiveOTP: false };
+  // ==============================================
+  // PRIVATE HELPER METHODS
+  // ==============================================
+
+  // Validate input based on method
+  private validateInput(identifier: string, method: 'phone' | 'email', deliveryInfo: OTPDeliveryInfo): {
+    isValid: boolean;
+    error?: string;
+  } {
+    if (method === 'phone') {
+      if (!identifier || !deliveryInfo.phoneNumber || !deliveryInfo.countryCode) {
+        return {
+          isValid: false,
+          error: 'Phone number and country code required for phone method'
+        };
       }
-
+      
+      // Validate phone number format
+      const phoneRegex = /^\+[1-9]\d{1,14}$/;
+      if (!phoneRegex.test(identifier)) {
+        return {
+          isValid: false,
+          error: 'Invalid phone number format'
+        };
+      }
+    } else if (method === 'email') {
+      if (!identifier || !deliveryInfo.email) {
+        return {
+          isValid: false,
+          error: 'Email address required for email method'
+        };
+      }
+      
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(identifier)) {
+        return {
+          isValid: false,
+          error: 'Invalid email format'
+        };
+      }
+    } else {
       return {
-        hasActiveOTP: true,
-        expiresAt: otp.expiresAt,
-        attemptsRemaining: otp.maxAttempts - otp.attempts,
-        deliveryMethod: otp.deliveryMethod
+        isValid: false,
+        error: 'Invalid authentication method'
       };
-    } catch (error) {
-      return { hasActiveOTP: false };
     }
-  }
 
-  // Private helper methods
+    return { isValid: true };
+  }
 
   // Generate OTP code
   private generateOTPCode(length: number, type: 'numeric' | 'alphanumeric'): string {
@@ -510,8 +549,8 @@ export class OTPService {
       }
       return otp;
     } else {
-      // Alphanumeric (excluding similar characters)
-      const chars = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+      // Alphanumeric (excluding similar characters like 0, O, 1, l, I)
+      const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
       let otp = '';
       for (let i = 0; i < length; i++) {
         otp += chars.charAt(Math.floor(Math.random() * chars.length));
@@ -529,44 +568,14 @@ export class OTPService {
   private async deliverOTP(
     otpCode: string,
     deliveryInfo: OTPDeliveryInfo,
-    method: 'sms' | 'email' | 'both'
+    method: 'phone' | 'email'
   ): Promise<{ success: boolean; error?: string }> {
-    const results: { sms?: boolean; email?: boolean } = {};
-
     try {
-      if (method === 'sms' || method === 'both') {
-        // SMS delivery would be implemented here
-        // For now, simulate success
-        results.sms = true;
-        console.log(`SMS OTP sent to ${deliveryInfo.phoneNumber}: ${otpCode}`);
+      if (method === 'phone') {
+        return await this.deliverSMSOTP(otpCode, deliveryInfo);
+      } else {
+        return await this.deliverEmailOTP(otpCode, deliveryInfo);
       }
-
-      if (method === 'email' || method === 'both') {
-        if (deliveryInfo.email) {
-          const emailResult = await emailService.sendOTPEmail(
-            deliveryInfo.email,
-            otpCode,
-            deliveryInfo.userName || 'User',
-            deliveryInfo.phoneNumber
-          );
-          results.email = emailResult.success;
-        } else {
-          results.email = false;
-        }
-      }
-
-      // Check if at least one delivery method succeeded
-      const hasSuccess = Object.values(results).some(result => result === true);
-      
-      if (!hasSuccess) {
-        return {
-          success: false,
-          error: 'All delivery methods failed'
-        };
-      }
-
-      return { success: true };
-
     } catch (error: any) {
       return {
         success: false,
@@ -575,56 +584,203 @@ export class OTPService {
     }
   }
 
-  // Update user temporary OTP (backward compatibility)
-  private async updateUserTempOTP(
-    phoneNumber: string,
-    countryCode: string,
-    otpCode: string,
-    expiresAt: Date
-  ): Promise<void> {
+  // Deliver OTP via SMS
+  private async deliverSMSOTP(otpCode: string, deliveryInfo: OTPDeliveryInfo): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (twilioSMSService.isConfigured()) {
+        const smsResult = await twilioSMSService.sendOTPSMS(
+          deliveryInfo.phoneNumber!,
+          otpCode,
+          'WhatsApp Clone',
+          OTP_CONFIG.EXPIRY_MINUTES
+        );
+
+        if (smsResult.success) {
+          console.log(`✅ SMS OTP sent to ${this.maskPhoneNumber(deliveryInfo.phoneNumber!)} via Twilio`);
+          
+          await analyticsTracker.trackFeatureUsage(
+            'system',
+            'sms',
+            'otp_sent',
+            {
+              phoneNumber: this.maskPhoneNumber(deliveryInfo.phoneNumber!),
+              provider: 'twilio',
+              messageId: smsResult.messageId
+            }
+          );
+
+          return { success: true };
+        } else {
+          console.error(`❌ SMS OTP delivery failed: ${smsResult.error}`);
+          
+          await analyticsTracker.trackFeatureUsage(
+            'system',
+            'sms',
+            'otp_failed',
+            {
+              phoneNumber: this.maskPhoneNumber(deliveryInfo.phoneNumber!),
+              provider: 'twilio',
+              error: smsResult.error
+            }
+          );
+
+          return {
+            success: false,
+            error: smsResult.error
+          };
+        }
+      } else {
+        // Fallback: Log to console if Twilio is not configured
+        console.log(`📱 SMS OTP (Console): ${deliveryInfo.phoneNumber} - Code: ${otpCode}`);
+        console.log(`⚠️  Twilio is not configured. Enable it by setting TWILIO_ENABLED=true and adding your Twilio credentials to .env`);
+        
+        await analyticsTracker.trackFeatureUsage(
+          'system',
+          'sms',
+          'otp_console',
+          {
+            phoneNumber: this.maskPhoneNumber(deliveryInfo.phoneNumber!),
+            provider: 'console'
+          }
+        );
+
+        return { success: true };
+      }
+    } catch (error: any) {
+      console.error(`❌ SMS service error:`, error);
+      
+      await analyticsTracker.trackError(error, 'system', {
+        component: 'otp_delivery',
+        action: 'sms_delivery',
+        phoneNumber: this.maskPhoneNumber(deliveryInfo.phoneNumber!)
+      });
+
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  // Deliver OTP via Email
+  private async deliverEmailOTP(otpCode: string, deliveryInfo: OTPDeliveryInfo): Promise<{ success: boolean; error?: string }> {
+    try {
+      const emailResult = await emailService.sendOTPEmail(
+        deliveryInfo.email!,
+        otpCode,
+        deliveryInfo.userName || 'User',
+        undefined // No phone number for email method
+      );
+      
+      if (emailResult.success) {
+        console.log(`✅ Email OTP sent to ${this.maskEmail(deliveryInfo.email!)}`);
+        
+        await analyticsTracker.trackFeatureUsage(
+          'system',
+          'email',
+          'otp_sent',
+          {
+            email: this.maskEmail(deliveryInfo.email!),
+            provider: 'email_service'
+          }
+        );
+
+        return { success: true };
+      } else {
+        console.error(`❌ Email OTP delivery failed: ${emailResult.error}`);
+        
+        await analyticsTracker.trackFeatureUsage(
+          'system',
+          'email',
+          'otp_failed',
+          {
+            email: this.maskEmail(deliveryInfo.email!),
+            error: emailResult.error
+          }
+        );
+
+        return {
+          success: false,
+          error: emailResult.error
+        };
+      }
+    } catch (error: any) {
+      console.error(`❌ Email service error:`, error);
+      
+      await analyticsTracker.trackError(error, 'system', {
+        component: 'otp_delivery',
+        action: 'email_delivery',
+        email: this.maskEmail(deliveryInfo.email!)
+      });
+
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  // Find user by identifier and method
+  private async findUserByIdentifier(identifier: string, method: 'phone' | 'email'): Promise<IUser | null> {
     try {
       await connectDB();
+      
+      if (method === 'phone') {
+        // For phone, we need to extract country code and phone number
+        // Assuming identifier is the full phone number with country code
+        return await User.findOne({ 
+          $or: [
+            { phoneNumber: identifier },
+            { phoneNumber: identifier.replace(/^\+/, '') }
+          ]
+        });
+      } else {
+        return await User.findOne({ email: identifier });
+      }
+    } catch (error) {
+      console.error('Error finding user by identifier:', error);
+      return null;
+    }
+  }
 
-      await User.findOneAndUpdate(
-        { phoneNumber, countryCode },
-        {
-          tempOTP: otpCode,
-          tempOTPExpires: expiresAt
-        },
-        { upsert: false }
-      );
+  // Update user temporary OTP
+  private async updateUserTempOTP(identifier: string, method: 'phone' | 'email', otpCode: string, expiresAt: Date): Promise<void> {
+    try {
+      await connectDB();
+      
+      const user = await this.findUserByIdentifier(identifier, method);
+      if (user) {
+        user.tempOTP = otpCode;
+        user.tempOTPExpires = expiresAt;
+        await user.save();
+      }
     } catch (error) {
       console.error('Error updating user temp OTP:', error);
     }
   }
 
   // Clear user temporary OTP
-  private async clearUserTempOTP(phoneNumber: string): Promise<void> {
+  private async clearUserTempOTP(identifier: string, method: 'phone' | 'email'): Promise<void> {
     try {
       await connectDB();
-
-      await User.updateMany(
-        { phoneNumber },
-        {
-          $unset: {
-            tempOTP: 1,
-            tempOTPExpires: 1
-          }
-        }
-      );
+      
+      const user = await this.findUserByIdentifier(identifier, method);
+      if (user) {
+        user.tempOTP = undefined;
+        user.tempOTPExpires = undefined;
+        await user.save();
+      }
     } catch (error) {
       console.error('Error clearing user temp OTP:', error);
     }
   }
 
-  // Find user by phone number
-  private async findUserByPhone(phoneNumber: string): Promise<any> {
-    try {
-      await connectDB();
-      return await User.findOne({ phoneNumber }).lean();
-    } catch (error) {
-      console.error('Error finding user by phone:', error);
-      return null;
+  // Mask identifier for logging
+  private maskIdentifier(identifier: string, method: 'phone' | 'email'): string {
+    if (method === 'phone') {
+      return this.maskPhoneNumber(identifier);
+    } else {
+      return this.maskEmail(identifier);
     }
   }
 
@@ -632,39 +788,144 @@ export class OTPService {
   public maskPhoneNumber(phoneNumber: string): string {
     if (phoneNumber.length <= 4) return phoneNumber;
     const visibleDigits = 2;
-    const start = phoneNumber.substring(0, visibleDigits);
+    const start = phoneNumber.substring(0, visibleDigits + 1); // Include country code +
     const end = phoneNumber.substring(phoneNumber.length - visibleDigits);
-    const masked = '*'.repeat(phoneNumber.length - (visibleDigits * 2));
-    return start + masked + end;
+    const masked = '*'.repeat(phoneNumber.length - (visibleDigits * 2) - 1);
+    return `${start}${masked}${end}`;
   }
+
+  // Mask email for logging
+  private maskEmail(email: string): string {
+    const [local, domain] = email.split('@');
+    if (local.length <= 3) {
+      return `${local[0]}***@${domain}`;
+    }
+    const maskedLocal = local.substring(0, 3) + '*'.repeat(Math.max(0, local.length - 3));
+    return `${maskedLocal}@${domain}`;
+  }
+
+  // ==============================================
+  // BULK OPERATIONS AND UTILITIES
+  // ==============================================
 
   // Get OTP statistics
   async getOTPStatistics(): Promise<{
-    activeOTPs: number;
+    activeCount: number;
+    expiredCount: number;
+    usedCount: number;
     dailyGenerated: number;
     dailyValidated: number;
-    successRate: number;
+    methodBreakdown: {
+      phone: { active: number; used: number };
+      email: { active: number; used: number };
+    };
   }> {
     try {
-      const stats = await this.otpStore.getStatistics();
-      return {
-        activeOTPs: stats.activeCount,
-        dailyGenerated: stats.dailyGenerated,
-        dailyValidated: stats.dailyValidated,
-        successRate: stats.dailyGenerated > 0 ? 
-          (stats.dailyValidated / stats.dailyGenerated) * 100 : 0
-      };
+      return await this.otpStore.getOTPStatistics();
     } catch (error) {
       console.error('Error getting OTP statistics:', error);
       return {
-        activeOTPs: 0,
+        activeCount: 0,
+        expiredCount: 0,
+        usedCount: 0,
         dailyGenerated: 0,
         dailyValidated: 0,
-        successRate: 0
+        methodBreakdown: {
+          phone: { active: 0, used: 0 },
+          email: { active: 0, used: 0 }
+        }
+      };
+    }
+  }
+
+  // Cleanup expired OTPs
+  async cleanupExpiredOTPs(): Promise<{
+    deleted: number;
+    errors: number;
+  }> {
+    try {
+      return await this.otpStore.cleanupExpiredOTPs();
+    } catch (error) {
+      console.error('Error cleaning up expired OTPs:', error);
+      return { deleted: 0, errors: 1 };
+    }
+  }
+
+  // Health check
+  async healthCheck(): Promise<{
+    status: 'healthy' | 'unhealthy';
+    services: {
+      sms: 'healthy' | 'unhealthy' | 'not_configured';
+      email: 'healthy' | 'unhealthy';
+      database: 'healthy' | 'unhealthy';
+      rateLimiter: 'healthy' | 'unhealthy';
+    };
+    stats: {
+      activeOTPs: number;
+      todayGenerated: number;
+    };
+  }> {
+    try {
+      const stats = await this.getOTPStatistics();
+      
+      // Check SMS service
+      let smsStatus: 'healthy' | 'unhealthy' | 'not_configured' = 'not_configured';
+      if (twilioSMSService.isConfigured()) {
+        smsStatus = 'healthy'; // Could add actual Twilio API test here
+      }
+
+      // Check email service
+      let emailStatus: 'healthy' | 'unhealthy' = 'healthy'; // Could add actual email test here
+
+      // Check database
+      let dbStatus: 'healthy' | 'unhealthy' = 'healthy';
+      try {
+        await connectDB();
+      } catch {
+        dbStatus = 'unhealthy';
+      }
+
+      // Check rate limiter
+      let rateLimiterStatus: 'healthy' | 'unhealthy' = 'healthy'; // Could add rate limiter test
+
+      const allHealthy = [smsStatus, emailStatus, dbStatus, rateLimiterStatus].every(
+        status => status === 'healthy' || status === 'not_configured'
+      );
+
+      return {
+        status: allHealthy ? 'healthy' : 'unhealthy',
+        services: {
+          sms: smsStatus,
+          email: emailStatus,
+          database: dbStatus,
+          rateLimiter: rateLimiterStatus
+        },
+        stats: {
+          activeOTPs: stats.activeCount,
+          todayGenerated: stats.dailyGenerated
+        }
+      };
+    } catch (error) {
+      console.error('OTP Service health check failed:', error);
+      return {
+        status: 'unhealthy',
+        services: {
+          sms: 'unhealthy',
+          email: 'unhealthy',
+          database: 'unhealthy',
+          rateLimiter: 'unhealthy'
+        },
+        stats: {
+          activeOTPs: 0,
+          todayGenerated: 0
+        }
       };
     }
   }
 }
 
-// Export singleton instance
+// ==============================================
+// EXPORT SINGLETON INSTANCE
+// ==============================================
+
 export const otpService = OTPService.getInstance();

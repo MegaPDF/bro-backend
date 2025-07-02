@@ -49,7 +49,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         'auth',
         'registration_failed',
         {
-          phoneNumber: otpService.maskPhoneNumber(phoneNumber),
+          phoneNumber: otpService.maskPhoneNumber(phoneNumber!),
           reason: 'user_exists',
           conflictField
         }
@@ -165,7 +165,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       'auth',
       'registration_success',
       {
-        phoneNumber: otpService.maskPhoneNumber(phoneNumber),
+        phoneNumber: otpService.maskPhoneNumber(phoneNumber!),
         platform,
         deviceId,
         hasEmail: !!email,
