@@ -7,7 +7,7 @@ import { ERROR_CODES, SUCCESS_MESSAGES, OTP_CONFIG } from '@/lib/utils/constants
 import { ErrorHelpers } from '@/lib/utils/helpers';
 import type { OTPResponse } from '@/types/auth';
 import type { APIResponse } from '@/types/api';
-import { otpService } from '@/lib/services/otp/otp-service';
+import { OTPDeliveryInfo, otpService } from '@/lib/services/otp/otp-service';
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
@@ -39,9 +39,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const isExistingUser = !!existingUser;
 
     // Generate and send OTP
-    const deliveryInfo = createDeliveryInfo(phoneNumber, countryCode, {
-      userName: existingUser?.displayName
-    });
+    const deliveryInfo: OTPDeliveryInfo = {
+  phoneNumber,
+  countryCode,
+  userName: existingUser?.displayName
+};
 
     const otpResult = await otpService.generateOTP(
       phoneNumber,

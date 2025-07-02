@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { connectDB } from '@/lib/db/connection';
-import User from '@/lib/db/models/User';
+import User, { type IUser } from '@/lib/db/models/User';
 import { verifyOTPSchema } from '@/lib/validations/auth';
 import { otpService } from '@/lib/services/otp/otp-service';
 import { analyticsTracker } from '@/lib/services/analytics/tracker';
@@ -30,15 +30,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const { userId, otp } = validation.data;
 
     // Find user by ID or get from OTP storage
-    let user = null;
-    let phoneNumber = '';
+   let user: IUser | null = null;
+let phoneNumber = '';
 
-    if (userId !== 'temporary') {
-      user = await User.findById(userId);
-      if (user) {
-        phoneNumber = user.phoneNumber;
-      }
-    }
+if (userId !== 'temporary') {
+  user = await User.findById(userId);
+  if (user) {
+    phoneNumber = user.phoneNumber;
+  }
+}
 
     // If no user found or temporary user, we need to get phone from OTP storage
     if (!phoneNumber) {
@@ -92,10 +92,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // Update user phone verification status if user exists
-    if (user && !user.phoneVerified) {
-      user.phoneVerified = true;
-      await user.save();
-    }
+    if (user && !user.isVerified) {
+  user.isVerified = true;
+  await user.save();
+}
 
     // Track successful verification
     await analyticsTracker.trackFeatureUsage(
