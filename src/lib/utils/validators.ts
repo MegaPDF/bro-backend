@@ -30,7 +30,7 @@ export const searchSchema = paginationSchema.extend({
   filters: z.record(z.any()).optional()
 });
 
-// File validation
+// File validation - FIXED VERSION
 export const fileValidationSchema = z.object({
   filename: z.string().min(1, 'Filename is required'),
   size: z.number().positive('File size must be positive'),
@@ -44,12 +44,15 @@ export const fileValidationSchema = z.object({
   message: `File size exceeds limit for ${data.type} files`,
   path: ['size']
 })).refine((data) => {
-  // Validate file extension
+  // Validate file extension - FIXED
   const extension = data.filename.toLowerCase().split('.').pop();
   if (!extension) return false;
   
-  const allowedExtensions = Array.from(SUPPORTED_FILE_TYPES[data.type.toUpperCase() as keyof typeof SUPPORTED_FILE_TYPES]);
-  return allowedExtensions.includes(`.${extension}`);
+  const extensionWithDot = `.${extension}`;
+  const allowedExtensions = SUPPORTED_FILE_TYPES[data.type.toUpperCase() as keyof typeof SUPPORTED_FILE_TYPES];
+  
+  // Type assertion to fix the TypeScript error
+  return (allowedExtensions as readonly string[]).includes(extensionWithDot);
 }, (data) => ({
   message: `File type not supported for ${data.type} files`,
   path: ['filename']

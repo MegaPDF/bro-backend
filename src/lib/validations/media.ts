@@ -13,7 +13,7 @@ export const mediaDimensionsSchema = z.object({
     .max(8192, 'Height too large')
 });
 
-// Media upload schema
+// Media upload schema - FIXED VERSION
 export const mediaUploadSchema = z.object({
   originalName: z.string()
     .min(1, 'Original filename required')
@@ -63,10 +63,15 @@ export const mediaUploadSchema = z.object({
     return false;
   }
   
-  // Validate file extension
-  const extension = `.${data.originalName.split('.').pop()?.toLowerCase()}`;
+  // Validate file extension - FIXED
+  const fileExtension = data.originalName.split('.').pop()?.toLowerCase();
+  if (!fileExtension) return false;
+  
+  const extension = `.${fileExtension}`;
   const allowedExtensions = SUPPORTED_FILE_TYPES[data.type.toUpperCase() as keyof typeof SUPPORTED_FILE_TYPES];
-  return allowedExtensions.includes(extension);
+  
+  // Type assertion to fix the TypeScript error
+  return (allowedExtensions as readonly string[]).includes(extension);
 }, {
   message: 'File type or size not supported for this media type',
   path: ['originalName']
