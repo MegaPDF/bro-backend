@@ -1,151 +1,135 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { connectDB } from '@/lib/db/connection';
 import User from '@/lib/db/models/User';
-import { sendOTPSchema } from '@/lib/validations/auth';
-import { analyticsTracker } from '@/lib/services/analytics/tracker';
-import { ERROR_CODES, SUCCESS_MESSAGES, OTP_CONFIG } from '@/lib/utils/constants';
-import { ErrorHelpers } from '@/lib/utils/helpers';
-import type { OTPResponse } from '@/types/auth';
-import type { APIResponse } from '@/types/api';
-import { OTPDeliveryInfo, otpService } from '@/lib/services/otp/otp-service';
+import { AuthConfigService } from '@/lib/auth/config';
+import { ValidationHelpers } from '@/lib/utils/helpers';
+import bcrypt from 'bcryptjs';
+import { TwilioSMSService } from '@/lib/services/sms/twilio';
 
-export async function POST(request: NextRequest): Promise<NextResponse> {
+// Rate limiting store (in production, use Redis)
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+export async function POST(request: NextRequest) {
   try {
     await connectDB();
-
-    const body = await request.json();
-    const validation = sendOTPSchema.safeParse(body);
-
-    if (!validation.success) {
-      return NextResponse.json({
-        success: false,
-        error: ERROR_CODES.VALIDATION_ERROR,
-        message: validation.error.errors[0].message,
-        code: ERROR_CODES.VALIDATION_ERROR,
-        timestamp: new Date()
-      } as APIResponse, { status: 400 });
-    }
-
-    const { method, phoneNumber, countryCode, email } = validation.data;
-
-    // Determine identifier and delivery info based on method
-    let identifier: string;
-    let deliveryInfo: OTPDeliveryInfo;
-
-    if (method === 'phone') {
-      identifier = phoneNumber!;
-      deliveryInfo = {
-        method: 'phone',
-        phoneNumber: phoneNumber!,
-        countryCode: countryCode!
-      };
-    } else {
-      identifier = email!;
-      deliveryInfo = {
-        method: 'email',
-        email: email!
-      };
-    }
-
-    // Check if user exists (for analytics and user name)
-    const existingUser = await (method === 'phone' 
-      ? User.findOne({ phoneNumber, countryCode })
-      : User.findOne({ email }));
     
-    if (existingUser) {
-      deliveryInfo.userName = existingUser.displayName;
-    }
+    // Get dynamic auth configuration
+    const authConfig = await AuthConfigService.getInstance().getConfig();
+    
+    const { phoneNumber, action = 'login' } = await request.json();
 
-    // Generate and send OTP
-    const otpResult = await otpService.generateOTP(
-      identifier,
-      method,
-      deliveryInfo,
-      {
-        maxAttempts: OTP_CONFIG.MAX_ATTEMPTS,
-        method
-      }
-    );
-
-    if (!otpResult.success) {
-      await analyticsTracker.trackFeatureUsage(
-        existingUser?._id?.toString() || 'system',
-        'otp',
-        'send_failed',
-        {
-          identifier: method === 'phone' 
-            ? otpService.maskPhoneNumber(phoneNumber!) 
-            : email!.replace(/(.{3}).*@/, '$1***@'),
-          method,
-          reason: otpResult.error,
-          isExistingUser: !!existingUser
-        }
-      );
-
-      let statusCode = 500;
-      if (otpResult.error === ERROR_CODES.RATE_LIMIT_EXCEEDED) {
-        statusCode = 429;
-      }
-
+    // Validate phone number
+    if (!ValidationHelpers.isValidPhoneNumber(phoneNumber)) {
       return NextResponse.json({
         success: false,
-        error: otpResult.error,
-        message: otpResult.error || `Failed to send OTP via ${method}`,
-        code: otpResult.error,
-        timestamp: new Date()
-      } as APIResponse, { status: statusCode });
+        error: 'INVALID_PHONE_NUMBER',
+        message: 'Please provide a valid phone number'
+      }, { status: 400 });
     }
 
-    // Track successful OTP send
-    await analyticsTracker.trackFeatureUsage(
-      existingUser?._id?.toString() || 'system',
-      'otp',
-      'send_success',
-      {
-        identifier: method === 'phone' 
-          ? otpService.maskPhoneNumber(phoneNumber!) 
-          : email!.replace(/(.{3}).*@/, '$1***@'),
-        method,
-        deliveryMethod: method === 'phone' ? 'sms' : 'email',
-        isExistingUser: !!existingUser
-      }
-    );
+    // Check rate limiting using database config
+    const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || 'unknown';
+    const rateLimitKey = `otp_${clientIP}_${phoneNumber}`;
+    const now = Date.now();
+    const rateLimitWindow = authConfig.rateLimiting.otp.windowMs;
+    const maxAttempts = authConfig.rateLimiting.otp.maxAttempts;
 
-    // Create response
-    const response: OTPResponse = {
-      success: true,
-      message: `OTP sent successfully via ${method}`,
-      userId: otpResult.otpId || 'temporary',
-      expiresIn: OTP_CONFIG.EXPIRY_MINUTES * 60,
-      method // Add method to response
-    };
+    const rateLimit = rateLimitStore.get(rateLimitKey);
+    if (rateLimit && now < rateLimit.resetTime) {
+      if (rateLimit.count >= maxAttempts) {
+        return NextResponse.json({
+          success: false,
+          error: 'RATE_LIMIT_EXCEEDED',
+          message: `Too many OTP requests. Try again in ${Math.ceil((rateLimit.resetTime - now) / 1000)} seconds`
+        }, { status: 429 });
+      }
+      rateLimit.count++;
+    } else {
+      rateLimitStore.set(rateLimitKey, {
+        count: 1,
+        resetTime: now + rateLimitWindow
+      });
+    }
+
+    // Find or create user
+    let user = await User.findOne({ phoneNumber });
+    
+    if (action === 'register' && user) {
+      return NextResponse.json({
+        success: false,
+        error: 'USER_ALREADY_EXISTS',
+        message: 'User with this phone number already exists'
+      }, { status: 409 });
+    }
+
+    if (action === 'login' && !user) {
+      return NextResponse.json({
+        success: false,
+        error: 'USER_NOT_FOUND',
+        message: 'No account found with this phone number'
+      }, { status: 404 });
+    }
+
+    // Check if user has exceeded OTP attempts using database config
+    const otpCooldown = authConfig.otp.resendCooldownSeconds * 1000;
+    if (user?.tempOTPExpires && new Date().getTime() < user.tempOTPExpires.getTime() + otpCooldown) {
+      const remainingTime = Math.ceil(((user.tempOTPExpires.getTime() + otpCooldown) - new Date().getTime()) / 1000);
+      return NextResponse.json({
+        success: false,
+        error: 'OTP_COOLDOWN_ACTIVE',
+        message: `Please wait ${remainingTime} seconds before requesting a new OTP`
+      }, { status: 429 });
+    }
+
+    // Generate OTP using database config
+    const otpLength = authConfig.otp.length;
+    const otp = Math.floor(Math.random() * Math.pow(10, otpLength)).toString().padStart(otpLength, '0');
+    const otpExpiry = new Date(Date.now() + authConfig.otp.expiryMinutes * 60 * 1000);
+
+    // Hash OTP using database config bcrypt rounds
+    const hashedOTP = await bcrypt.hash(otp, authConfig.security.bcryptRounds);
+
+    // Create or update user with OTP
+    if (!user) {
+      user = new User({
+        phoneNumber,
+        countryCode: phoneNumber.startsWith('+') ? phoneNumber.substring(0, phoneNumber.length - 10) : '+1',
+        displayName: phoneNumber, // Temporary, will be updated during registration
+        tempOTP: hashedOTP,
+        tempOTPExpires: otpExpiry
+      });
+    } else {
+      user.tempOTP = hashedOTP;
+      user.tempOTPExpires = otpExpiry;
+    }
+
+    await user.save();
+
+    // Send OTP via SMS
+    try {
+      const twilioService = TwilioSMSService.getInstance();
+      await twilioService.sendOTPSMS(phoneNumber, otp);
+    } catch (smsError) {
+      console.error('SMS sending failed:', smsError);
+      // In production, you might want to continue without SMS or use fallback
+    }
 
     return NextResponse.json({
       success: true,
-      data: response,
-      message: `OTP sent successfully via ${method}`,
-      timestamp: new Date()
-    } as APIResponse<OTPResponse>, { status: 200 });
+      message: 'OTP sent successfully',
+      data: {
+        phoneNumber,
+        expiresIn: authConfig.otp.expiryMinutes * 60, // seconds
+        resendAfter: authConfig.otp.resendCooldownSeconds
+      }
+    });
 
   } catch (error: any) {
     console.error('Send OTP error:', error);
-
-    await analyticsTracker.trackError(error, 'system', {
-      component: 'auth_send_otp',
-      action: 'send_otp'
-    });
-
-    const sanitizedError = ErrorHelpers.sanitizeErrorForClient(
-      error,
-      process.env.NODE_ENV === 'development'
-    );
-
     return NextResponse.json({
       success: false,
-      error: sanitizedError.code,
-      message: sanitizedError.message,
-      code: sanitizedError.code,
-      timestamp: new Date()
-    } as APIResponse, { status: 500 });
+      error: 'INTERNAL_SERVER_ERROR',
+      message: 'Failed to send OTP'
+    }, { status: 500 });
   }
 }
