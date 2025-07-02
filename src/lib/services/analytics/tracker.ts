@@ -52,8 +52,6 @@ export class AnalyticsTracker {
   private flushInterval = 30000; // 30 seconds
   private isFlushingBatch = false;
 private isValidObjectId(id: string): boolean {
-  // Check if the string is a valid MongoDB ObjectId format
-  // Must be 24 character hex string
   return mongoose.Types.ObjectId.isValid(id) && (id.length === 24);
 }
   constructor() {
@@ -235,61 +233,64 @@ private isValidObjectId(id: string): boolean {
   }
 
   // Flush events to database
-  private async flushEvents(): Promise<void> {
-    if (this.isFlushingBatch || this.batchEvents.length === 0) {
-      return;
-    }
+ private async flushEvents(): Promise<void> {
+  if (this.isFlushingBatch || this.batchEvents.length === 0) {
+    return;
+  }
 
-    this.isFlushingBatch = true;
+  this.isFlushingBatch = true;
 
-    try {
-      await connectDB();
+  let eventsToFlush: TrackingEvent[] = [];
+  try {
+    await connectDB();
 
-      const eventsToFlush = [...this.batchEvents];
-      this.batchEvents = [];
+    eventsToFlush = [...this.batchEvents];
+    this.batchEvents = [];
 
-      // Group events by hour for aggregation
-      const aggregatedEvents = this.aggregateEvents(eventsToFlush);
+    // Group events by hour for aggregation
+    const aggregatedEvents = this.aggregateEvents(eventsToFlush);
 
-      // Save aggregated events to database
-      const bulkOps = aggregatedEvents.map(event => ({
-        updateOne: {
-          filter: {
+    // Save aggregated events to database
+    const bulkOps = aggregatedEvents.map(event => ({
+      updateOne: {
+        filter: {
+          type: event.type,
+          date: event.date,
+          'dimensions.userId': event.dimensions?.userId,
+          'dimensions.chatId': event.dimensions?.chatId,
+          'dimensions.groupId': event.dimensions?.groupId
+        },
+        update: {
+          $inc: event.metrics,
+          $set: {
             type: event.type,
             date: event.date,
-            'dimensions.userId': event.dimensions?.userId,
-            'dimensions.chatId': event.dimensions?.chatId,
-            'dimensions.groupId': event.dimensions?.groupId
+            data: event.data,
+            dimensions: event.dimensions
           },
-          update: {
-            $inc: event.metrics,
-            $set: {
-              type: event.type,
-              date: event.date,
-              data: event.data,
-              dimensions: event.dimensions
-            },
-            $setOnInsert: {
-              createdAt: new Date(),
-              updatedAt: new Date()
-            }
-          },
-          upsert: true
-        }
-      }));
-
-      if (bulkOps.length > 0) {
-        await Analytics.bulkWrite(bulkOps);
+          // Remove the manual updatedAt setting to avoid conflict
+          // MongoDB will handle timestamps automatically due to timestamps: true
+          $setOnInsert: {
+            createdAt: new Date()
+            // Removed: updatedAt: new Date() - this causes the conflict
+          }
+        },
+        upsert: true
       }
+    }));
 
-    } catch (error) {
-      console.error('Error flushing analytics events:', error);
-      // Re-add events to batch for retry
-      this.batchEvents.unshift(...this.batchEvents);
-    } finally {
-      this.isFlushingBatch = false;
+    if (bulkOps.length > 0) {
+      await Analytics.bulkWrite(bulkOps);
     }
+
+  } catch (error) {
+    console.error('Error flushing analytics events:', error);
+    // Re-add events to batch for retry (fixed the logic)
+    this.batchEvents.unshift(...eventsToFlush); // Use eventsToFlush, not this.batchEvents
+  } finally {
+    this.isFlushingBatch = false;
   }
+}
 
   // Aggregate events by time period
  private aggregateEvents(events: TrackingEvent[]): Partial<IAnalytics>[] {

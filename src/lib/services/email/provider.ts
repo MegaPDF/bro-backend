@@ -413,26 +413,28 @@ export class EmailProviderService {
   }
 
   // Save email template to database
-  async saveEmailTemplate(templateName: string, template: EmailTemplate): Promise<void> {
-    try {
-      await connectDB();
+ async saveEmailTemplate(templateName: string, template: EmailTemplate): Promise<void> {
+  try {
+    await connectDB();
 
-      await Settings.findOneAndUpdate(
-        { category: 'email', key: `template_${templateName}` },
-        {
-          value: template,
-          type: 'object',
-          description: `Email template for ${templateName}`,
-          isPublic: false,
-          updatedBy: 'system'
-        },
-        { upsert: true, new: true }
-      );
-    } catch (error) {
-      console.error('Error saving email template:', error);
-      throw error;
-    }
+    // For system-generated templates, we'll omit the updatedBy field
+    // since there's no actual admin updating these settings
+    await Settings.findOneAndUpdate(
+      { category: 'email', key: `template_${templateName}` },
+      {
+        value: template,
+        type: 'object',
+        description: `Email template for ${templateName}`,
+        isPublic: false,
+        // Remove updatedBy for system operations or make the field optional
+      },
+      { upsert: true, new: true }
+    );
+  } catch (error) {
+    console.error('Error saving email template:', error);
+    throw error;
   }
+}
 
   // Get current provider info
   getCurrentProvider(): EmailProviderConfig | null {

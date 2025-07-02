@@ -61,7 +61,8 @@ const UserSchema: Schema = new Schema({
   countryCode: { type: String, required: true },
   username: { type: String, unique: true, sparse: true },
   displayName: { type: String, required: true },
-  email: { type: String, unique: true, sparse: true },
+  email: { type: String, index: { unique: true, sparse: true } },
+  emailVerified: { type: Boolean, default: false },
   avatar: { type: String },
   about: { type: String, default: 'Available' },
   isVerified: { type: Boolean, default: false },
@@ -110,10 +111,9 @@ const UserSchema: Schema = new Schema({
   timestamps: true
 });
 
-UserSchema.index({ phoneNumber: 1 });
-UserSchema.index({ username: 1 });
-UserSchema.index({ email: 1 });
 UserSchema.index({ status: 1 });
 UserSchema.index({ isOnline: 1 });
+UserSchema.index({ lastSeen: 1 }); 
+UserSchema.index({ isVerified: 1 });
 
 export default mongoose.models.User || mongoose.model<IUser>('User', UserSchema);
