@@ -2,7 +2,35 @@ import { z } from 'zod';
 import { REGEX_PATTERNS, FILE_SIZE_LIMITS, SUPPORTED_FILE_TYPES } from './constants';
 import { ValidationHelpers } from './helpers';
 
-// Base validation schemas
+// Re-export validation schemas from dedicated files
+export { 
+  settingsCreateSchema, 
+  settingsUpdateSchema,
+  settingsBulkUpdateSchema 
+} from '../validations/settings';
+
+export { 
+  statusCreateSchema, 
+  statusUpdateSchema,
+  statusPrivacySchema,
+  statusViewerSchema 
+} from '../validations/status';
+
+export { 
+  chatCreateSchema, 
+  chatUpdateSchema,
+  groupSettingsSchema,
+  disappearingMessagesSchema 
+} from '../validations/chat';
+
+export { 
+  groupCreateSchema, 
+  groupUpdateSchema,
+  groupMemberManagementSchema,
+  groupInviteSchema 
+} from '../validations/group';
+
+// Base validation schemas (keep these as shared utilities)
 export const baseSchemas = {
   objectId: z.string().refine(ValidationHelpers.isValidObjectId, 'Invalid ID format'),
   email: z.string().email('Invalid email format'),
@@ -30,7 +58,7 @@ export const searchSchema = paginationSchema.extend({
   filters: z.record(z.any()).optional()
 });
 
-// File validation - FIXED VERSION
+// File validation
 export const fileValidationSchema = z.object({
   filename: z.string().min(1, 'Filename is required'),
   size: z.number().positive('File size must be positive'),
@@ -44,21 +72,20 @@ export const fileValidationSchema = z.object({
   message: `File size exceeds limit for ${data.type} files`,
   path: ['size']
 })).refine((data) => {
-  // Validate file extension - FIXED
+  // Validate file extension
   const extension = data.filename.toLowerCase().split('.').pop();
   if (!extension) return false;
   
   const extensionWithDot = `.${extension}`;
   const allowedExtensions = SUPPORTED_FILE_TYPES[data.type.toUpperCase() as keyof typeof SUPPORTED_FILE_TYPES];
   
-  // Type assertion to fix the TypeScript error
   return (allowedExtensions as readonly string[]).includes(extensionWithDot);
 }, (data) => ({
   message: `File type not supported for ${data.type} files`,
   path: ['filename']
 }));
 
-// User validation schemas
+// User validation schemas (keep these if no dedicated user validation file exists)
 export const userValidationSchemas = {
   create: z.object({
     phoneNumber: baseSchemas.phoneNumber,
@@ -107,7 +134,7 @@ export const userValidationSchemas = {
   })
 };
 
-// Message validation schemas
+// Message validation schemas (keep these if no dedicated message validation file exists)
 export const messageValidationSchemas = {
   create: z.object({
     chatId: baseSchemas.objectId,
@@ -164,51 +191,7 @@ export const messageValidationSchemas = {
   })
 };
 
-// Chat validation schemas
-export const chatValidationSchemas = {
-  create: z.object({
-    type: z.enum(['individual', 'group']),
-    participants: z.array(baseSchemas.objectId).min(1, 'At least one participant required').max(256, 'Too many participants'),
-    groupInfo: z.object({
-      name: z.string().min(1, 'Group name required').max(100, 'Group name too long'),
-      description: z.string().max(500, 'Description too long').optional(),
-      avatar: z.string().url().optional(),
-      settings: z.object({
-        onlyAdminsCanMessage: z.boolean().default(false),
-        onlyAdminsCanEditGroupInfo: z.boolean().default(false),
-        approvalRequired: z.boolean().default(false)
-      }).optional()
-    }).optional()
-  }).refine((data) => {
-    if (data.type === 'group' && !data.groupInfo) {
-      return false;
-    }
-    if (data.type === 'individual' && data.participants.length !== 2) {
-      return false;
-    }
-    return true;
-  }, 'Invalid chat configuration'),
-
-  update: z.object({
-    groupInfo: z.object({
-      name: z.string().min(1).max(100).optional(),
-      description: z.string().max(500).optional(),
-      avatar: z.string().url().optional(),
-      settings: z.object({
-        onlyAdminsCanMessage: z.boolean().optional(),
-        onlyAdminsCanEditGroupInfo: z.boolean().optional(),
-        approvalRequired: z.boolean().optional()
-      }).optional()
-    }).optional(),
-    disappearingMessages: z.object({
-      enabled: z.boolean(),
-      duration: baseSchemas.nonNegativeInteger,
-      enabledBy: baseSchemas.objectId
-    }).optional()
-  })
-};
-
-// Call validation schemas
+// Call validation schemas (keep these if no dedicated call validation file exists)
 export const callValidationSchemas = {
   initiate: z.object({
     type: z.enum(['voice', 'video']),
@@ -233,32 +216,7 @@ export const callValidationSchemas = {
   })
 };
 
-// Status validation schemas
-export const statusValidationSchemas = {
-  create: z.object({
-    type: z.enum(['text', 'image', 'video']),
-    content: z.string().max(700, 'Status text too long').optional(),
-    mediaId: baseSchemas.objectId.optional(),
-    backgroundColor: baseSchemas.hexColor.optional(),
-    textColor: baseSchemas.hexColor.optional(),
-    font: z.string().max(50).optional(),
-    privacy: z.object({
-      type: z.enum(['everyone', 'contacts', 'contacts_except', 'only_share_with']),
-      excludedContacts: z.array(baseSchemas.objectId).optional(),
-      selectedContacts: z.array(baseSchemas.objectId).optional()
-    }).optional()
-  }).refine((data) => {
-    if (data.type === 'text' && !data.content) {
-      return false;
-    }
-    if (['image', 'video'].includes(data.type) && !data.mediaId) {
-      return false;
-    }
-    return true;
-  }, 'Invalid status content for type')
-};
-
-// Admin validation schemas
+// Admin validation schemas (keep these if no dedicated admin validation file exists)
 export const adminValidationSchemas = {
   create: z.object({
     username: z.string().min(3, 'Username too short').max(30, 'Username too long'),
@@ -312,28 +270,7 @@ export const adminValidationSchemas = {
   })
 };
 
-// Settings validation schemas
-export const settingsValidationSchemas = {
-  create: z.object({
-    category: z.enum(['aws', 'email', 'coturn', 'push_notifications', 'general', 'security', 'features']),
-    key: z.string().min(1, 'Key required').max(100, 'Key too long'),
-    value: z.any(),
-    type: z.enum(['string', 'number', 'boolean', 'object', 'array']),
-    description: z.string().min(1, 'Description required').max(200, 'Description too long'),
-    isEncrypted: z.boolean().default(false),
-    isPublic: z.boolean().default(false)
-  }),
-
-  bulkUpdate: z.object({
-    settings: z.array(z.object({
-      key: z.string().min(1),
-      value: z.any(),
-      category: z.enum(['aws', 'email', 'coturn', 'push_notifications', 'general', 'security', 'features'])
-    })).min(1, 'At least one setting required').max(50, 'Too many settings')
-  })
-};
-
-// Export validation function
+// Utility functions for validation
 export function validateData<T>(schema: z.ZodSchema<T>, data: unknown): {
   success: boolean;
   data?: T;

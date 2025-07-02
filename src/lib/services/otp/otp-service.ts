@@ -629,7 +629,7 @@ export class OTPService {
   }
 
   // Mask phone number for logging
-  private maskPhoneNumber(phoneNumber: string): string {
+  public maskPhoneNumber(phoneNumber: string): string {
     if (phoneNumber.length <= 4) return phoneNumber;
     const visibleDigits = 2;
     const start = phoneNumber.substring(0, visibleDigits);

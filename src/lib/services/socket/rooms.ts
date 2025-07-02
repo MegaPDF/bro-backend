@@ -14,6 +14,37 @@ import type {
 } from '@/types/socket';
 import type { SocketRoom } from '@/types/api';
 
+// Define proper types for MongoDB documents
+interface ChatDocument {
+  _id: string;
+  participants: string[];
+  isActive?: boolean;
+}
+
+interface CallDocument {
+  _id: string;
+  participants: Array<{
+    userId: string;
+    status: string;
+  }>;
+  isActive?: boolean;
+}
+
+interface AdminDocument {
+  _id: string;
+  isActive: boolean;
+  role: string;
+}
+
+interface GroupDocument {
+  _id: string;
+  members: Array<{
+    userId: string;
+  }>;
+  chatId?: string;
+  isActive: boolean;
+}
+
 export interface RoomInfo {
   roomId: string;
   type: 'user' | 'chat' | 'call' | 'admin' | 'broadcast';
@@ -79,14 +110,14 @@ export class SocketRoomsManager {
     try {
       await connectDB();
 
-      // Verify chat access
-      const chat = await Chat.findById(chatId).lean();
+      // Verify chat access with proper typing
+      const chat = await Chat.findById(chatId).lean() as ChatDocument | null;
       if (!chat) {
         throw new Error('Chat not found');
       }
 
       const userId = socket.data?.userId;
-      if (!userId || !chat.participants.some(p => p.toString() === userId)) {
+      if (!userId || !chat.participants.includes(userId)) {
         throw new Error('Access denied to chat');
       }
 
@@ -113,7 +144,7 @@ export class SocketRoomsManager {
 
     } catch (error) {
       console.error('Error joining chat room:', error);
-      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error.message });
+      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -136,14 +167,14 @@ export class SocketRoomsManager {
     try {
       await connectDB();
 
-      // Verify call access
-      const call = await Call.findById(callId).lean();
+      // Verify call access with proper typing
+      const call = await Call.findById(callId).lean() as CallDocument | null;
       if (!call) {
         throw new Error('Call not found');
       }
 
       const userId = socket.data?.userId;
-      if (!userId || !call.participants.some(p => p.userId.toString() === userId)) {
+      if (!userId || !call.participants.some(p => p.userId === userId)) {
         throw new Error('Access denied to call');
       }
 
@@ -176,7 +207,7 @@ export class SocketRoomsManager {
 
     } catch (error) {
       console.error('Error joining call room:', error);
-      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error.message });
+      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -208,8 +239,8 @@ export class SocketRoomsManager {
     try {
       await connectDB();
 
-      // Verify admin access
-      const admin = await Admin.findById(adminId).lean();
+      // Verify admin access with proper typing
+      const admin = await Admin.findById(adminId).lean() as AdminDocument | null;
       if (!admin || !admin.isActive) {
         throw new Error('Admin access denied');
       }
@@ -227,16 +258,16 @@ export class SocketRoomsManager {
 
       console.log(`Admin ${adminId} joined admin room: ${roomId}`);
 
-      // Notify other admins
-      socket.to(roomId).emit('admin:user_joined', {
+      // Notify other admins using proper event type
+      socket.to(roomId).emit('admin:user_joined' as keyof ServerToClientEvents, {
         adminId,
         role: admin.role,
         timestamp: new Date()
-      });
+      } as any);
 
     } catch (error) {
       console.error('Error joining admin room:', error);
-      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error.message });
+      socket.emit(SOCKET_EVENTS.SYSTEM_ERROR, { error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -247,11 +278,11 @@ export class SocketRoomsManager {
       await socket.leave(roomId);
       this.removeSocketFromRoom(socket.id, roomId);
 
-      // Notify other admins
-      socket.to(roomId).emit('admin:user_left', {
+      // Notify other admins using proper event type
+      socket.to(roomId).emit('admin:user_left' as keyof ServerToClientEvents, {
         adminId,
         timestamp: new Date()
-      });
+      } as any);
 
       console.log(`Admin ${adminId} left admin room: ${roomId}`);
 
@@ -260,33 +291,51 @@ export class SocketRoomsManager {
     }
   }
 
-  // Broadcasting methods
-  broadcastToUserRoom(userId: string, event: string, data: any): void {
+  // Broadcasting methods with proper event typing
+  broadcastToUserRoom<K extends keyof ServerToClientEvents>(
+    userId: string, 
+    event: K, 
+    ...args: Parameters<ServerToClientEvents[K]>
+  ): void {
     const roomId = this.getUserRoomName(userId);
-    this.io.to(roomId).emit(event, data);
+    this.io.to(roomId).emit(event, ...args);
     this.updateRoomActivity(roomId);
   }
 
-  broadcastToChatRoom(chatId: string, event: string, data: any): void {
+  broadcastToChatRoom<K extends keyof ServerToClientEvents>(
+    chatId: string, 
+    event: K, 
+    ...args: Parameters<ServerToClientEvents[K]>
+  ): void {
     const roomId = this.getChatRoomName(chatId);
-    this.io.to(roomId).emit(event, data);
+    this.io.to(roomId).emit(event, ...args);
     this.updateRoomActivity(roomId);
   }
 
-  broadcastToCallRoom(callId: string, event: string, data: any): void {
+  broadcastToCallRoom<K extends keyof ServerToClientEvents>(
+    callId: string, 
+    event: K, 
+    ...args: Parameters<ServerToClientEvents[K]>
+  ): void {
     const roomId = this.getCallRoomName(callId);
-    this.io.to(roomId).emit(event, data);
+    this.io.to(roomId).emit(event, ...args);
     this.updateRoomActivity(roomId);
   }
 
-  broadcastToAdminRoom(event: string, data: any): void {
+  broadcastToAdminRoom<K extends keyof ServerToClientEvents>(
+    event: K, 
+    ...args: Parameters<ServerToClientEvents[K]>
+  ): void {
     const roomId = this.getAdminRoomName();
-    this.io.to(roomId).emit(event, data);
+    this.io.to(roomId).emit(event, ...args);
     this.updateRoomActivity(roomId);
   }
 
-  broadcastToAll(event: string, data: any): void {
-    this.io.emit(event, data);
+  broadcastToAll<K extends keyof ServerToClientEvents>(
+    event: K, 
+    ...args: Parameters<ServerToClientEvents[K]>
+  ): void {
+    this.io.emit(event, ...args);
   }
 
   // Group-specific methods
@@ -294,11 +343,11 @@ export class SocketRoomsManager {
     try {
       await connectDB();
 
-      // Get user's groups
+      // Get user's groups with proper typing
       const groups = await Group.find({ 
         'members.userId': userId,
         isActive: true 
-      }).lean();
+      }).lean() as unknown as GroupDocument[];
 
       // Join all group chat rooms
       for (const group of groups) {

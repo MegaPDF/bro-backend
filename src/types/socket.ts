@@ -49,9 +49,8 @@ export interface ClientToServerEvents {
   'message:send': (data: MessageCreateRequest) => void;
   'message:edit': (data: { messageId: string } & MessageUpdateRequest) => void;
   'message:delete': (data: { messageId: string; deleteForEveryone: boolean }) => void;
-  'message:react': (data: { messageId: string; emoji: string }) => void;
   'message:read': (data: { messageId: string; chatId: string }) => void;
-  
+  "message:reaction": (data: { messageId: string; emoji: string }) => void;
   // Chat Events
   'chat:typing': (data: { chatId: string; isTyping: boolean }) => void;
   'chat:join': (data: { chatId: string }) => void;

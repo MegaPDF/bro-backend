@@ -3,8 +3,8 @@ import { connectDB } from '@/lib/db/connection';
 import Settings from '@/lib/db/models/Settings';
 import User from '@/lib/db/models/User';
 import Notification from '@/lib/db/models/Notification';
-import { NOTIFICATION_TYPES } from '@/lib/utils/constants';
 import { analyticsTracker } from '../analytics/tracker';
+import type { IUser } from '@/lib/db/models/User';
 import type { INotification } from '@/lib/db/models/Notification';
 
 export interface APNSConfig {
@@ -44,24 +44,22 @@ export interface APNSResult {
 
 export class APNSService {
   private provider: apn.Provider | null = null;
-  private config: APNSConfig | null = null;
   private isInitialized = false;
 
   constructor() {
-    this.initialize();
+    this.initializeAPNS();
   }
 
-  // Initialize APNS provider
-  private async initialize(): Promise<void> {
+  // Initialize APNS
+  private async initializeAPNS(): Promise<void> {
     try {
       const config = await this.getAPNSConfig();
+      
       if (!config) {
-        console.warn('APNS configuration not found');
+        console.warn('APNS configuration not found in settings');
         return;
       }
 
-      this.config = config;
-      
       const options: apn.ProviderOptions = {
         token: {
           key: config.key,
@@ -73,29 +71,19 @@ export class APNSService {
 
       this.provider = new apn.Provider(options);
       this.isInitialized = true;
-
+      
       console.log('APNS service initialized successfully');
 
     } catch (error: any) {
-      console.error('Failed to initialize APNS service:', error);
+      console.error('APNS initialization error:', error);
       this.isInitialized = false;
     }
   }
 
-  // Send notification to iOS devices
+  // Send notification
   async sendNotification(notification: APNSNotification): Promise<APNSResult> {
-    if (!this.isInitialized || !this.provider || !this.config) {
-      return {
-        success: false,
-        successful: [],
-        failed: notification.deviceTokens.map(token => ({
-          deviceToken: token,
-          error: 'APNS service not initialized'
-        })),
-        totalSent: 0,
-        successCount: 0,
-        failureCount: notification.deviceTokens.length
-      };
+    if (!this.isInitialized || !this.provider) {
+      throw new Error('APNS service not initialized');
     }
 
     try {
@@ -106,64 +94,50 @@ export class APNSService {
         title: notification.title,
         body: notification.body
       };
-
+      
+      apnNotification.sound = notification.sound || 'default';
       if (notification.badge !== undefined) {
         apnNotification.badge = notification.badge;
       }
-
-      if (notification.sound) {
-        apnNotification.sound = notification.sound;
-      }
-
-      if (notification.category) {
-        apnNotification.category = notification.category;
-      }
-
       if (notification.threadId) {
         apnNotification.threadId = notification.threadId;
       }
-
-      if (notification.data) {
-        apnNotification.payload = notification.data;
-      }
-
-      // Set priority
       apnNotification.priority = notification.priority === 'high' ? 10 : 5;
-
-      // Set expiry
+      if (notification.collapseId !== undefined) {
+        apnNotification.collapseId = notification.collapseId;
+      }
+      
       if (notification.expiry) {
         apnNotification.expiry = Math.floor(notification.expiry.getTime() / 1000);
       }
 
-      // Set collapse ID
-      if (notification.collapseId) {
-        apnNotification.collapseId = notification.collapseId;
+      // Set custom data
+      if (notification.data) {
+        apnNotification.payload = { ...apnNotification.payload, ...notification.data };
       }
 
-      // Set bundle ID
-      apnNotification.topic = this.config.bundleId;
-
       // Send to all device tokens
-      const result = await this.provider.send(apnNotification, notification.deviceTokens);
+      const response = await this.provider.send(apnNotification, notification.deviceTokens);
 
       const successful: string[] = [];
       const failed: Array<{ deviceToken: string; error: string; errorCode?: string }> = [];
 
-      // Process results
-      result.sent.forEach(response => {
-        successful.push(response.device);
+      // Process successful sends
+      response.sent.forEach(({ device }) => {
+        successful.push(device);
       });
 
-      result.failed.forEach(response => {
+      // Process failed sends
+      response.failed.forEach(({ device, error }) => {
         failed.push({
-          deviceToken: response.device,
-          error: response.error?.message || 'Unknown error',
-          errorCode: (response.error as any)?.code
+          deviceToken: device,
+          error: error?.message || 'Unknown error',
+          errorCode: (error && typeof (error as any).code !== 'undefined') ? (error as any).code : undefined
         });
       });
 
       // Handle invalid tokens
-      await this.handleInvalidTokens(result.failed);
+      await this.handleInvalidTokens(response.failed);
 
       // Track analytics
       await analyticsTracker.trackFeatureUsage(
@@ -171,19 +145,19 @@ export class APNSService {
         'push_notifications',
         'apns_send',
         {
-          totalSent: result.sent.length,
-          totalFailed: result.failed.length,
-          success: result.sent.length > 0
+          totalSent: successful.length,
+          totalFailed: failed.length,
+          success: successful.length > 0
         }
       );
 
       return {
-        success: result.sent.length > 0,
+        success: successful.length > 0,
         successful,
         failed,
         totalSent: notification.deviceTokens.length,
-        successCount: result.sent.length,
-        failureCount: result.failed.length
+        successCount: successful.length,
+        failureCount: failed.length
       };
 
     } catch (error: any) {
@@ -204,64 +178,42 @@ export class APNSService {
   }
 
   // Send notification from database notification record
-  async sendFromNotification(notificationId: string): Promise<APNSResult> {
+  async sendNotificationFromDB(notificationId: string): Promise<APNSResult> {
     try {
       await connectDB();
 
-      const notification = await Notification.findById(notificationId)
-        .populate('userId')
-        .lean();
-
-      if (!notification) {
+      const notificationDoc = await Notification.findById(notificationId).lean() as INotification | null;
+      if (!notificationDoc) {
         throw new Error('Notification not found');
       }
 
-      // Get iOS device tokens for the user
-      const user = await User.findById(notification.userId).lean();
-      if (!user) {
-        throw new Error('User not found');
+      // Get iOS platform delivery info
+      const iosPlatform = notificationDoc.platformDelivery?.find(
+        (platform: any) => platform.platform === 'ios'
+      );
+
+      if (!iosPlatform || !iosPlatform.deviceTokens || iosPlatform.deviceTokens.length === 0) {
+        return this.createEmptyResult();
       }
 
-      const iosTokens = user.devices
-        .filter(device => device.platform === 'ios' && device.pushToken)
-        .map(device => device.pushToken!);
-
-      if (iosTokens.length === 0) {
-        return {
-          success: false,
-          successful: [],
-          failed: [],
-          totalSent: 0,
-          successCount: 0,
-          failureCount: 0
-        };
-      }
-
-      // Create APNS notification
-      const apnsNotification: APNSNotification = {
-        deviceTokens: iosTokens,
-        title: notification.title,
-        body: notification.body,
-        badge: notification.badge,
-        sound: notification.sound || 'default',
-        data: notification.data,
-        priority: notification.priority === 'high' ? 'high' : 'normal'
+      const notification: APNSNotification = {
+        deviceTokens: iosPlatform.deviceTokens,
+        title: notificationDoc.title,
+        body: notificationDoc.body,
+        sound: notificationDoc.ios?.sound || notificationDoc.sound || 'default',
+        badge: notificationDoc.ios?.badge || notificationDoc.badge,
+        category: notificationDoc.ios?.category,
+        threadId: notificationDoc.ios?.threadId,
+        data: notificationDoc.data,
+        priority: notificationDoc.priority === 'critical' || notificationDoc.priority === 'high' ? 'high' : 'normal'
       };
 
-      // Add category based on notification type
-      if (notification.type === NOTIFICATION_TYPES.MESSAGE) {
-        apnsNotification.category = 'MESSAGE_CATEGORY';
-        apnsNotification.threadId = notification.data.chatId;
-      } else if (notification.type === NOTIFICATION_TYPES.CALL) {
-        apnsNotification.category = 'CALL_CATEGORY';
-      }
-
-      const result = await this.sendNotification(apnsNotification);
+      const result = await this.sendNotification(notification);
 
       // Update notification status
       await Notification.findByIdAndUpdate(notificationId, {
-        isSent: result.success,
-        sentAt: new Date(),
+        'platformDelivery.$.status': result.success ? 'sent' : 'failed',
+        'platformDelivery.$.sentAt': new Date(),
         deliveryStatus: result.success ? 'sent' : 'failed'
       });
 
@@ -284,14 +236,20 @@ export class APNSService {
     try {
       await connectDB();
 
-      const user = await User.findById(userId).lean();
-      if (!user || !user.notificationSettings.messageNotifications) {
+      const user = await User.findById(userId).lean() as IUser | null;
+      if (!user || !user.notificationSettings?.messageNotifications) {
         return this.createEmptyResult();
       }
 
-      const iosTokens = user.devices
-        .filter(device => device.platform === 'ios' && device.pushToken)
-        .map(device => device.pushToken!);
+      // Get iOS device tokens
+      const iosTokens: string[] = [];
+      if (user.devices && Array.isArray(user.devices)) {
+        user.devices.forEach(device => {
+          if (device.platform === 'ios' && device.pushToken) {
+            iosTokens.push(device.pushToken);
+          }
+        });
+      }
 
       if (iosTokens.length === 0) {
         return this.createEmptyResult();
@@ -332,14 +290,20 @@ export class APNSService {
     try {
       await connectDB();
 
-      const user = await User.findById(userId).lean();
-      if (!user || !user.notificationSettings.callNotifications) {
+      const user = await User.findById(userId).lean() as IUser | null;
+      if (!user || !user.notificationSettings?.callNotifications) {
         return this.createEmptyResult();
       }
 
-      const iosTokens = user.de
-        .filter(device => device.platform === 'ios' && device.pushToken)
-        .map(device => device.pushToken!);
+      // Get iOS device tokens
+      const iosTokens: string[] = [];
+      if (user.devices && Array.isArray(user.devices)) {
+        user.devices.forEach(device => {
+          if (device.platform === 'ios' && device.pushToken) {
+            iosTokens.push(device.pushToken);
+          }
+        });
+      }
 
       if (iosTokens.length === 0) {
         return this.createEmptyResult();
@@ -391,7 +355,7 @@ export class APNSService {
         teamId: teamIdSetting.value,
         bundleId: bundleIdSetting.value,
         key: keySetting.value,
-        production: prodSetting?.value || false
+        production: prodSetting?.value === true || prodSetting?.value === 'true'
       };
 
     } catch (error) {
@@ -406,9 +370,12 @@ export class APNSService {
       const invalidTokens: string[] = [];
 
       failedResponses.forEach(response => {
-        if (response.error?.code === 'InvalidToken' || 
-            response.error?.code === 'BadDeviceToken' ||
-            response.error?.code === 'Unregistered') {
+        const errorCode = (response.error && typeof (response.error as any).code !== 'undefined')
+          ? (response.error as any).code
+          : undefined;
+        if (errorCode === 'InvalidToken' || 
+            errorCode === 'BadDeviceToken' ||
+            errorCode === 'Unregistered') {
           invalidTokens.push(response.device);
         }
       });

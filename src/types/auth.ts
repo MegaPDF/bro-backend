@@ -1,4 +1,4 @@
-import { UserDevice, UserStatus } from "./api";
+import { DeviceInfo, UserStatus } from "./api";
 
 export interface AuthUser {
   _id: string;
@@ -27,7 +27,7 @@ export interface RegisterRequest {
 
 export interface QRLoginRequest {
   qrToken: string;
-  deviceInfo: UserDevice;
+  deviceInfo: DeviceInfo;
 }
 
 export interface RefreshTokenRequest {

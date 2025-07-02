@@ -68,7 +68,11 @@ export const CALL_TYPES = {
 
 export const CALL_STATUS = {
   INITIATED: 'initiated',
+  CONNECTING: 'connecting',
   RINGING: 'ringing',
+  DECLINED: 'declined',
+  BUSY: 'busy',
+  MISSED: 'missed',
   CONNECTED: 'connected',
   ENDED: 'ended',
   FAILED: 'failed',
@@ -190,6 +194,7 @@ export const SOCKET_EVENTS = {
   MESSAGE_UPDATED: 'message:updated',
   MESSAGE_DELETED: 'message:deleted',
   MESSAGE_REACTION: 'message:reaction',
+  MESSAGE_MENTION: 'message:mention',
   MESSAGE_READ: 'message:read',
   MESSAGE_DELIVERED: 'message:delivered',
   
@@ -210,10 +215,13 @@ export const SOCKET_EVENTS = {
   // Calls
   CALL_INCOMING: 'call:incoming',
   CALL_ACCEPTED: 'call:accepted',
+  CALL_UPDATE: 'call:update',
   CALL_DECLINED: 'call:declined',
   CALL_ENDED: 'call:ended',
   CALL_INITIATE: 'call:initiate',
   CALL_WEBRTC_SIGNAL: 'call:webrtc_signal',
+  CALL_PARTICIPANT_JOINED: 'call:participant_joined',
+  CALL_PARTICIPANT_LEFT: 'call:participant_left',
   
   // Status
   STATUS_NEW: 'status:new',
@@ -341,7 +349,8 @@ export const TIME_CONSTANTS = {
 // Default Values
 export const DEFAULTS = {
   USER_ABOUT: 'Available',
-  GROUP_MAX_MEMBERS: 256,
+  GROUP_MAX_MEMBERS: 5000,
+  CALL_MAX_PARTICIPANTS: 10,
   STATUS_EXPIRY_HOURS: 24,
   MESSAGE_EDIT_TIME_LIMIT: 15 * 60 * 1000, // 15 minutes
   TYPING_TIMEOUT: 3000, // 3 seconds

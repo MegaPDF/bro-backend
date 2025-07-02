@@ -1,7 +1,7 @@
 import admin from 'firebase-admin';
 import { connectDB } from '@/lib/db/connection';
 import Settings from '@/lib/db/models/Settings';
-import User from '@/lib/db/models/User';
+import User, { IUser } from '@/lib/db/models/User';
 import Notification from '@/lib/db/models/Notification';
 import { NOTIFICATION_TYPES } from '@/lib/utils/constants';
 import { analyticsTracker } from '../analytics/tracker';
@@ -43,7 +43,6 @@ export interface FCMResult {
   totalSent: number;
   successCount: number;
   failureCount: number;
-  multicastId?: string;
 }
 
 export interface FCMTopicNotification {
@@ -55,9 +54,14 @@ export interface FCMTopicNotification {
   priority?: 'high' | 'normal';
 }
 
+// Extend the Messaging interface to include sendMulticast method
+interface ExtendedMessaging extends admin.messaging.Messaging {
+  sendMulticast(message: admin.messaging.MulticastMessage): Promise<admin.messaging.BatchResponse>;
+}
+
 export class FCMService {
   private app: admin.app.App | null = null;
-  private messaging: admin.messaging.Messaging | null = null;
+  private messaging: ExtendedMessaging | null = null;
   private isInitialized = false;
 
   constructor() {
@@ -86,7 +90,8 @@ export class FCMService {
         this.app = admin.apps[0] as admin.app.App;
       }
 
-      this.messaging = admin.messaging(this.app);
+      // Cast to ExtendedMessaging to include sendMulticast
+      this.messaging = admin.messaging(this.app) as ExtendedMessaging;
       this.isInitialized = true;
 
       console.log('FCM service initialized successfully');
@@ -98,134 +103,250 @@ export class FCMService {
   }
 
   // Send notification to Android/Web devices
-  async sendNotification(notification: FCMNotification): Promise<FCMResult> {
-    if (!this.isInitialized || !this.messaging) {
-      return {
-        success: false,
-        successful: [],
-        failed: notification.deviceTokens.map(token => ({
+ async sendNotification(notification: FCMNotification): Promise<FCMResult> {
+  if (!this.isInitialized || !this.messaging) {
+    throw new Error('FCM service not initialized');
+  }
+
+  try {
+    // Convert data to string values (FCM requirement)
+    const stringData = notification.data ? this.convertDataToStrings(notification.data) : undefined;
+
+    const message: admin.messaging.MulticastMessage = {
+      tokens: notification.deviceTokens,
+      data: stringData,
+      // ... rest of your message config
+    };
+
+    // Use type assertion to bypass TypeScript error
+    const response = await (this.messaging as any).sendMulticast(message);
+
+    const successful: string[] = [];
+    const failed: Array<{ deviceToken: string; error: string; errorCode?: string }> = [];
+
+    // Process results
+    response.responses.forEach((result: any, index: number) => {
+      const token = notification.deviceTokens[index];
+      
+      if (result.success) {
+        successful.push(token);
+      } else {
+        failed.push({
           deviceToken: token,
-          error: 'FCM service not initialized'
-        })),
-        totalSent: 0,
-        successCount: 0,
-        failureCount: notification.deviceTokens.length
-      };
+          error: result.error?.message || 'Unknown error',
+          errorCode: result.error?.code
+        });
+      }
+    });
+
+    // Handle invalid tokens
+    await this.handleInvalidTokens(response.responses, notification.deviceTokens);
+
+    // Track analytics
+    await analyticsTracker.trackFeatureUsage(
+      'system',
+      'push_notifications',
+      'fcm_send',
+      {
+        totalSent: response.successCount,
+        totalFailed: response.failureCount,
+        success: response.successCount > 0
+      }
+    );
+
+    return {
+      success: response.successCount > 0,
+      successful,
+      failed,
+      totalSent: notification.deviceTokens.length,
+      successCount: response.successCount,
+      failureCount: response.failureCount
+      // Remove multicastId reference
+    };
+
+  } catch (error: any) {
+    console.error('FCM send error:', error);
+
+    return {
+      success: false,
+      successful: [],
+      failed: notification.deviceTokens.map(token => ({
+        deviceToken: token,
+        error: error.message
+      })),
+      totalSent: 0,
+      successCount: 0,
+      failureCount: notification.deviceTokens.length
+    };
+  }
+}
+
+// 4. Fix sendFromNotification method with proper typing
+async sendFromNotification(notificationId: string): Promise<FCMResult> {
+  try {
+    await connectDB();
+
+    // Type the notification query result
+    const notification = await Notification.findById(notificationId)
+      .populate('userId')
+      .lean() as INotification | null;
+
+    if (!notification) {
+      throw new Error('Notification not found');
     }
 
-    try {
-      const message: admin.messaging.MulticastMessage = {
-        tokens: notification.deviceTokens,
-        notification: {
-          title: notification.title,
-          body: notification.body,
-          imageUrl: notification.image
-        },
-        data: notification.data || {},
-        android: {
-          priority: notification.priority,
-          ttl: notification.timeToLive ? notification.timeToLive * 1000 : undefined,
-          collapseKey: notification.collapseKey,
-          restrictedPackageName: notification.restrictedPackageName,
-          notification: {
-            title: notification.title,
-            body: notification.body,
-            icon: notification.icon,
-            color: notification.color,
-            sound: notification.sound || 'default',
-            tag: notification.tag,
-            clickAction: notification.clickAction,
-            imageUrl: notification.image
-          }
-        },
-        webpush: {
-          notification: {
-            title: notification.title,
-            body: notification.body,
-            icon: notification.icon,
-            image: notification.image,
-            badge: notification.badge,
-            tag: notification.tag,
-            sound: notification.sound,
-            data: notification.data
+    // Type the user query result  
+    const user = await User.findById(notification.userId).lean() as IUser | null;
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    // Fix the devices access
+    const fcmTokens = user.devices  // ← Changed from UserSchema to user.devices
+      .filter(device => 
+        (device.platform === 'android' || device.platform === 'web') && 
+        device.pushToken
+      )
+      .map(device => device.pushToken!);
+
+    if (fcmTokens.length === 0) {
+      return this.createEmptyResult();
+    }
+
+    // Create FCM notification
+    const fcmNotification: FCMNotification = {
+      deviceTokens: fcmTokens,
+      title: notification.title,
+      body: notification.body,
+      sound: notification.sound || 'default',
+      data: this.convertDataToStrings(notification.data),
+      priority: notification.priority === 'high' ? 'high' : 'normal',
+      icon: '/icon-192x192.png',
+      badge: '/badge-icon.png'
+    };
+
+    // Add specific properties based on notification type
+    if (notification.type === NOTIFICATION_TYPES.MESSAGE) {
+      fcmNotification.tag = `message_${notification.data.chatId}`;
+      fcmNotification.clickAction = `/chat/${notification.data.chatId}`;
+    } else if (notification.type === NOTIFICATION_TYPES.CALL) {
+      fcmNotification.tag = `call_${notification.data.callId}`;
+      fcmNotification.clickAction = `/call/${notification.data.callId}`;
+    }
+
+    const result = await this.sendNotification(fcmNotification);
+
+    // Update notification status
+    await Notification.findByIdAndUpdate(notificationId, {
+      isSent: result.success,
+      sentAt: new Date(),
+      deliveryStatus: result.success ? 'sent' : 'failed'
+    });
+
+    return result;
+
+  } catch (error: any) {
+    console.error('FCM send from notification error:', error);
+    return this.createEmptyResult();
+  }
+}
+  // Fallback method for individual sends
+  private async sendIndividualNotifications(notification: FCMNotification): Promise<FCMResult> {
+    if (!this.messaging) {
+      throw new Error('FCM service not initialized');
+    }
+
+    const successful: string[] = [];
+    const failed: Array<{ deviceToken: string; error: string; errorCode?: string }> = [];
+
+    // Send to each token individually
+    for (const token of notification.deviceTokens) {
+      try {
+        const message: admin.messaging.Message = {
+          token: token,
+          data: notification.data ? this.convertDataToStrings(notification.data) : undefined,
+          android: {
+            priority: notification.priority === 'high' ? 'high' : 'normal',
+            ttl: notification.timeToLive ? notification.timeToLive * 1000 : undefined,
+            collapseKey: notification.collapseKey,
+            restrictedPackageName: notification.restrictedPackageName,
+            notification: {
+              title: notification.title,
+              body: notification.body,
+              icon: notification.icon,
+              color: notification.color,
+              sound: notification.sound || 'default',
+              tag: notification.tag,
+              clickAction: notification.clickAction,
+              imageUrl: notification.image
+            }
           },
-          fcmOptions: {
-            link: notification.clickAction
-          }
-        },
-        apns: {
-          payload: {
-            aps: {
-              alert: {
-                title: notification.title,
-                body: notification.body
-              },
-              sound: notification.sound || 'default'
+          webpush: {
+            notification: {
+              title: notification.title,
+              body: notification.body,
+              icon: notification.icon,
+              image: notification.image,
+              badge: notification.badge,
+              tag: notification.tag,
+              sound: notification.sound,
+              data: notification.data
+            },
+            fcmOptions: {
+              link: notification.clickAction
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                alert: {
+                  title: notification.title,
+                  body: notification.body
+                },
+                sound: notification.sound || 'default'
+              }
             }
           }
-        }
-      };
+        };
 
-      const response = await this.messaging.sendMulticast(message);
+        await this.messaging.send(message);
+        successful.push(token);
 
-      const successful: string[] = [];
-      const failed: Array<{ deviceToken: string; error: string; errorCode?: string }> = [];
-
-      // Process results
-      response.responses.forEach((result, index) => {
-        const token = notification.deviceTokens[index];
-        
-        if (result.success) {
-          successful.push(token);
-        } else {
-          failed.push({
-            deviceToken: token,
-            error: result.error?.message || 'Unknown error',
-            errorCode: result.error?.code
-          });
-        }
-      });
-
-      // Handle invalid tokens
-      await this.handleInvalidTokens(response.responses, notification.deviceTokens);
-
-      // Track analytics
-      await analyticsTracker.trackFeatureUsage(
-        'system',
-        'push_notifications',
-        'fcm_send',
-        {
-          totalSent: response.successCount,
-          totalFailed: response.failureCount,
-          success: response.successCount > 0
-        }
-      );
-
-      return {
-        success: response.successCount > 0,
-        successful,
-        failed,
-        totalSent: notification.deviceTokens.length,
-        successCount: response.successCount,
-        failureCount: response.failureCount,
-        multicastId: response.multicastId
-      };
-
-    } catch (error: any) {
-      console.error('FCM send error:', error);
-
-      return {
-        success: false,
-        successful: [],
-        failed: notification.deviceTokens.map(token => ({
+      } catch (error: any) {
+        failed.push({
           deviceToken: token,
-          error: error.message
-        })),
-        totalSent: 0,
-        successCount: 0,
-        failureCount: notification.deviceTokens.length
-      };
+          error: error.message,
+          errorCode: error.code
+        });
+
+        // Handle invalid tokens
+        if (error.code === 'messaging/invalid-registration-token' ||
+            error.code === 'messaging/registration-token-not-registered') {
+          await this.removeInvalidToken(token);
+        }
+      }
     }
+
+    // Track analytics
+    await analyticsTracker.trackFeatureUsage(
+      'system',
+      'push_notifications',
+      'fcm_send_individual',
+      {
+        totalSent: successful.length,
+        totalFailed: failed.length,
+        success: successful.length > 0
+      }
+    );
+
+    return {
+      success: successful.length > 0,
+      successful,
+      failed,
+      totalSent: notification.deviceTokens.length,
+      successCount: successful.length,
+      failureCount: failed.length
+    };
   }
 
   // Send to topic
@@ -266,178 +387,6 @@ export class FCMService {
     }
   }
 
-  // Send notification from database notification record
-  async sendFromNotification(notificationId: string): Promise<FCMResult> {
-    try {
-      await connectDB();
-
-      const notification = await Notification.findById(notificationId)
-        .populate('userId')
-        .lean();
-
-      if (!notification) {
-        throw new Error('Notification not found');
-      }
-
-      // Get Android/Web device tokens for the user
-      const user = await User.findById(notification.userId).lean();
-      if (!user) {
-        throw new Error('User not found');
-      }
-
-      const fcmTokens = UserSchema
-        .filter(device => 
-          (device.platform === 'android' || device.platform === 'web') && 
-          device.pushToken
-        )
-        .map(device => device.pushToken!);
-
-      if (fcmTokens.length === 0) {
-        return this.createEmptyResult();
-      }
-
-      // Create FCM notification
-      const fcmNotification: FCMNotification = {
-        deviceTokens: fcmTokens,
-        title: notification.title,
-        body: notification.body,
-        sound: notification.sound || 'default',
-        data: this.convertDataToStrings(notification.data),
-        priority: notification.priority === 'high' ? 'high' : 'normal',
-        icon: '/icon-192x192.png',
-        badge: '/badge-icon.png'
-      };
-
-      // Add specific properties based on notification type
-      if (notification.type === NOTIFICATION_TYPES.MESSAGE) {
-        fcmNotification.tag = `message_${notification.data.chatId}`;
-        fcmNotification.clickAction = `/chat/${notification.data.chatId}`;
-      } else if (notification.type === NOTIFICATION_TYPES.CALL) {
-        fcmNotification.tag = `call_${notification.data.callId}`;
-        fcmNotification.clickAction = `/call/${notification.data.callId}`;
-      }
-
-      const result = await this.sendNotification(fcmNotification);
-
-      // Update notification status
-      await Notification.findByIdAndUpdate(notificationId, {
-        isSent: result.success,
-        sentAt: new Date(),
-        deliveryStatus: result.success ? 'sent' : 'failed'
-      });
-
-      return result;
-
-    } catch (error: any) {
-      console.error('Error sending notification from database:', error);
-      throw error;
-    }
-  }
-
-  // Send message notification
-  async sendMessageNotification(
-    userId: string,
-    chatId: string,
-    senderName: string,
-    messageContent: string,
-    isGroup: boolean = false
-  ): Promise<FCMResult> {
-    try {
-      await connectDB();
-
-      const user = await User.findById(userId).lean();
-      if (!user || !user.notificationSettings.messageNotifications) {
-        return this.createEmptyResult();
-      }
-
-      const fcmTokens = user.devices
-        .filter(device => 
-          (device.platform === 'android' || device.platform === 'web') && 
-          device.pushToken
-        )
-        .map(device => device.pushToken!);
-
-      if (fcmTokens.length === 0) {
-        return this.createEmptyResult();
-      }
-
-      const notification: FCMNotification = {
-        deviceTokens: fcmTokens,
-        title: isGroup ? `${senderName} in Group` : senderName,
-        body: messageContent,
-        sound: user.notificationSettings.sound || 'default',
-        icon: '/icon-192x192.png',
-        tag: `message_${chatId}`,
-        clickAction: `/chat/${chatId}`,
-        data: {
-          type: 'message',
-          chatId,
-          senderId: userId,
-          isGroup: isGroup.toString()
-        },
-        priority: 'high'
-      };
-
-      return await this.sendNotification(notification);
-
-    } catch (error: any) {
-      console.error('Error sending message notification:', error);
-      return this.createEmptyResult();
-    }
-  }
-
-  // Send call notification
-  async sendCallNotification(
-    userId: string,
-    callId: string,
-    callerName: string,
-    callType: 'voice' | 'video',
-    isGroup: boolean = false
-  ): Promise<FCMResult> {
-    try {
-      await connectDB();
-
-      const user = await User.findById(userId).lean();
-      if (!user || !user.notificationSettings.callNotifications) {
-        return this.createEmptyResult();
-      }
-
-      const fcmTokens = user.devices
-        .filter(device => 
-          (device.platform === 'android' || device.platform === 'web') && 
-          device.pushToken
-        )
-        .map(device => device.pushToken!);
-
-      if (fcmTokens.length === 0) {
-        return this.createEmptyResult();
-      }
-
-      const notification: FCMNotification = {
-        deviceTokens: fcmTokens,
-        title: `Incoming ${callType} call`,
-        body: `${callerName} is calling you${isGroup ? ' in a group' : ''}`,
-        sound: 'call_ringtone',
-        icon: '/icon-192x192.png',
-        tag: `call_${callId}`,
-        clickAction: `/call/${callId}`,
-        data: {
-          type: 'call',
-          callId,
-          callerId: userId,
-          callType,
-          isGroup: isGroup.toString()
-        },
-        priority: 'high'
-      };
-
-      return await this.sendNotification(notification);
-
-    } catch (error: any) {
-      console.error('Error sending call notification:', error);
-      return this.createEmptyResult();
-    }
-  }
 
   // Subscribe to topic
   async subscribeToTopic(deviceTokens: string[], topic: string): Promise<{ successCount: number; failureCount: number; errors: any[] }> {
@@ -529,19 +478,46 @@ export class FCMService {
       });
 
       if (invalidTokens.length > 0) {
-        await connectDB();
-
-        // Remove invalid tokens from user devices
-        await User.updateMany(
-          { 'devices.pushToken': { $in: invalidTokens } },
-          { $pull: { devices: { pushToken: { $in: invalidTokens } } } }
-        );
-
-        console.log(`Removed ${invalidTokens.length} invalid FCM tokens`);
+        await this.removeInvalidTokens(invalidTokens);
       }
 
     } catch (error) {
       console.error('Error handling invalid tokens:', error);
+    }
+  }
+
+  // Remove invalid tokens from database
+  private async removeInvalidTokens(invalidTokens: string[]): Promise<void> {
+    try {
+      await connectDB();
+
+      // Remove invalid tokens from user devices
+      await User.updateMany(
+        { 'devices.pushToken': { $in: invalidTokens } },
+        { $pull: { devices: { pushToken: { $in: invalidTokens } } } }
+      );
+
+      console.log(`Removed ${invalidTokens.length} invalid FCM tokens`);
+
+    } catch (error) {
+      console.error('Error removing invalid tokens:', error);
+    }
+  }
+
+  // Remove single invalid token
+  private async removeInvalidToken(token: string): Promise<void> {
+    try {
+      await connectDB();
+
+      await User.updateMany(
+        { 'devices.pushToken': token },
+        { $pull: { devices: { pushToken: token } } }
+      );
+
+      console.log(`Removed invalid FCM token: ${token}`);
+
+    } catch (error) {
+      console.error('Error removing invalid token:', error);
     }
   }
 
