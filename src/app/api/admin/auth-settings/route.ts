@@ -1,7 +1,7 @@
 
 import { AuthConfigService } from '@/lib/auth/config';
 import { connectDB } from '@/lib/db/connection';
-import { adminAuthMiddleware } from '@/lib/middleware/admin-auth';
+import { authWithAdmin } from '@/lib/auth/middleware';
 import { NextRequest, NextResponse } from 'next/server';
 
 // GET /api/admin/auth-settings - Get current auth configuration
@@ -10,7 +10,7 @@ export async function GET(request: NextRequest) {
     await connectDB();
     
     // Check admin authentication
-    const authResult = await adminAuthMiddleware(request, {
+    const authResult = await authWithAdmin(request, {
       requiredPermissions: ['settings.read']
     });
     
@@ -68,7 +68,7 @@ export async function PUT(request: NextRequest) {
     await connectDB();
     
     // Check admin authentication
-    const authResult = await adminAuthMiddleware(request, {
+    const authResult = await authWithAdmin(request, {
       requiredPermissions: ['settings.write']
     });
     
